@@ -1956,6 +1956,7 @@ mod ocpp_1_6 {
     use crate::wire::v16::StatusNotificationRequest;
     use crate::wire::v16::common::{ErrorCode, StatusNotificationRequestStatus};
     use alloc::boxed::Box;
+    use alloc::vec::Vec;
     use ocpp_client::ClientError;
     use ocpp_client::ocpp_1_6::{OCPP1_6Client, OCPP1_6Error};
 

@@ -136,7 +136,9 @@ pub struct ConnectionTarget {
     /// sent to (module docs, "Credentials are not carried across").
     origin: String,
     username: Option<String>,
-    password: Option<String>,
+    /// The original password verbatim - `ConnectOptions::password` is bytes because OCPP
+    /// configures it hex-encoded, so it is not necessarily UTF-8.
+    password: Option<Vec<u8>>,
     timeout: Option<Duration>,
     inner: Mutex<Inner>,
 }
@@ -204,7 +206,7 @@ impl ConnectionTarget {
         Arc::new(Self {
             origin: address.to_string(),
             username: options.username.map(ToString::to_string),
-            password: options.password.map(ToString::to_string),
+            password: options.password.map(<[u8]>::to_vec),
             timeout: options.timeout,
             inner: Mutex::new(Inner {
                 active: address.to_string(),
@@ -579,6 +581,7 @@ impl ConnectionTarget {
         };
         let password = rotated_password
             .as_deref()
+            .map(str::as_bytes)
             .or_else(|| is_origin.then_some(self.password.as_deref()).flatten());
         let options = ConnectOptions {
             username: is_origin.then_some(self.username.as_deref()).flatten(),

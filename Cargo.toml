@@ -224,7 +224,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time"], o
 # so the conversion is on every outbound and inbound protocol path. Enabled unconditionally, not
 # behind this crate's `std`: `ocpp-types` takes chrono as `default-features = false`, so it costs
 # the bare-metal build nothing, and chrono is already a direct dependency below.
-ocpp-client = { version = "0.5.0", default-features = false, features = ["chrono"] }
+ocpp-client = { version = "0.6.0", default-features = false, features = ["chrono"] }
 async-trait = "^0.1"
 # `default-features = false` drops `tracing`'s (really `tracing-core`'s) `std` feature, which
 # pulls in `once_cell` - and `once_cell`'s default build does not compile for a bare-metal
@@ -264,3 +264,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 futures = "0.3"
 serde_json = "1"
+
+# The ccsx-br fork of ocpp-client carries the embassy-net transport crate and the
+# firmware-targeted fixes this crate's embedded consumers need. Keeping the patch here makes
+# standalone builds of this fork resolve `ocpp-client` to the same source the firmware's own
+# `[patch.crates-io]` does (a second, unpatched ocpp-client in the graph would duplicate every
+# public type).
+[patch.crates-io]
+ocpp-client = { git = "https://github.com/ccsx-br/ocpp-client", rev = "2ec01c8" }
