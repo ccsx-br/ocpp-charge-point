@@ -365,15 +365,26 @@ pub async fn run_transaction_persistence<S: Storage, C: Clock>(
 ) {
     // The last record written per connector, shadowed in memory so the write policy can consult
     // it without a read-back on every event (a read per meter sample would defeat the point of
-    // bounding writes). Rebuilt from storage at start-up so a restart mid-session doesn't reset
-    // the threshold's baseline.
+    // bounding writes). A shadow miss still consults storage once: a transaction resumed across
+    // this boot keeps its record on purpose (see `restore_transactions_with_resume`), and both
+    // the threshold's baseline and the record's start time must carry forward from it - which is
+    // also the "rebuilt from storage at start-up" behaviour a restart mid-session needs to not
+    // reset the threshold's baseline.
     let mut shadow: Vec<(usize, usize, PersistedTransaction)> = Vec::new();
     while let Ok(occurred) = events.recv().await {
         let address = (occurred.evse_id, occurred.connector_id);
-        let previous = shadow
+        let stored;
+        let previous = match shadow
             .iter()
             .find(|(evse_id, connector_id, _)| (*evse_id, *connector_id) == address)
-            .map(|(_, _, record)| record);
+            .map(|(_, _, record)| record)
+        {
+            Some(record) => Some(record),
+            None => {
+                stored = store.load(address.0, address.1).await;
+                stored.as_ref()
+            }
+        };
         match persistence_decision(previous, &occurred, store.meter_write_threshold_wh()) {
             PersistenceDecision::Skip => {}
             PersistenceDecision::Clear => {
@@ -424,12 +435,19 @@ fn next_record<C: Clock>(
     occurred: &TransactionEventOccurred,
     clock: &C,
 ) -> PersistedTransaction {
+    // A previous record only carries forward when it belongs to *this* transaction - which is
+    // exactly what a resumed transaction's surviving record is (see
+    // `restore_transactions_with_resume`): its `Started` re-announcing itself over the record it
+    // kept is not a new session, so the start time and meter baseline established before the
+    // reboot carry forward rather than being restamped. A record under a different transaction
+    // id is a leftover, not a baseline - nothing of it may bleed into a new session.
+    let previous = previous.filter(|previous| previous.transaction.id == occurred.transaction.id);
     let started_at = match (occurred.kind, previous) {
-        (TransactionEventKind::Started, _) => {
+        (_, Some(previous)) => previous.started_at,
+        (TransactionEventKind::Started, None) => {
             let now = clock.now();
             crate::clock::is_synchronized(&now).then_some(now)
         }
-        (_, Some(previous)) => previous.started_at,
         // Reached only if the record written at start never made it to storage; the transaction
         // is still worth persisting, just without a trustworthy start time.
         (_, None) => None,
@@ -465,6 +483,27 @@ pub async fn restore_transactions<S: Storage>(
     actor: &ChargePointActor,
     store: &TransactionStore<S>,
 ) -> usize {
+    restore_transactions_with_resume(actor, store, &[]).await
+}
+
+/// [`restore_transactions`] with a per-connector resume decision: every recovered record whose
+/// `(evse_id, connector_id)` appears in `resume` is handed to the state machine with
+/// [`RecoveredTransaction::resume`] set - re-installed as a live transaction rather than closed
+/// out with `PowerLoss` - and is deliberately **left in storage**, since the session it describes
+/// is still running and the record is still its durability. Closed-out records are cleared
+/// exactly as [`restore_transactions`] does.
+///
+/// The `resume` list is the integrator's assertion that the hardware kept the session alive
+/// across the reboot - something this crate cannot see for itself (see
+/// [`RecoveredTransaction::resume`]). An integrator without that assertion calls
+/// [`restore_transactions`] and gets the close-out behaviour unchanged.
+///
+/// Returns the number of transactions recovered, resumed or not (`0` on a clean boot).
+pub async fn restore_transactions_with_resume<S: Storage>(
+    actor: &ChargePointActor,
+    store: &TransactionStore<S>,
+    resume: &[(usize, usize)],
+) -> usize {
     let connector_counts: Vec<usize> = actor
         .state()
         .evses
@@ -477,6 +516,10 @@ pub async fn restore_transactions<S: Storage>(
     if recovered > 0 {
         tracing::warn!(
             count = recovered,
+            resumed = records
+                .iter()
+                .filter(|record| resume.contains(&(record.evse_id, record.connector_id)))
+                .count(),
             "recovering transactions that were in flight when the charge point last lost power"
         );
     }
@@ -486,6 +529,7 @@ pub async fn restore_transactions<S: Storage>(
             evse_id: record.evse_id,
             connector_id: record.connector_id,
             transaction: record.transaction.clone(),
+            resume: resume.contains(&(record.evse_id, record.connector_id)),
         })
         .collect();
     let _ = actor
@@ -498,6 +542,12 @@ pub async fn restore_transactions<S: Storage>(
     // here re-recovers the same transactions on the next boot, which is a duplicate report the
     // CSMS can reconcile - clearing first would instead lose them outright.
     for record in &records {
+        // A resumed transaction's record is its durability for the *rest* of the session, not a
+        // leftover: the persistence task keeps updating it from here on (see
+        // `run_transaction_persistence`'s shadow handling) until the transaction actually ends.
+        if resume.contains(&(record.evse_id, record.connector_id)) {
+            continue;
+        }
         store.clear(record.evse_id, record.connector_id).await;
     }
     recovered
@@ -3803,6 +3853,149 @@ mod tests {
         let store = TransactionStore::new(InMemoryStorage::new());
 
         assert_eq!(restore_transactions(&actor, &store).await, 0);
+    }
+
+    /// The `resume` half of recovery: a connector the integrator marked is re-installed as a
+    /// live transaction (`Started`, not `Ended`), and - critically - its record stays in
+    /// storage, because the session it describes is still running and still needs durability.
+    #[tokio::test]
+    async fn a_resumed_recovery_restarts_the_transaction_and_keeps_its_record() {
+        let executor = crate::executor::TokioExecutor;
+        let actor = ChargePointActor::spawn([1], &executor);
+        let mut recovered_events = actor.subscribe_transaction_events();
+        let store = TransactionStore::new(InMemoryStorage::new());
+        store.save(&record(Some(4_200))).await;
+
+        assert_eq!(
+            restore_transactions_with_resume(&actor, &store, &[(0, 0)]).await,
+            1
+        );
+
+        let reported = recovered_events.recv().await.expect("a restart event");
+        assert_eq!(reported.kind, TransactionEventKind::Started);
+        assert_eq!(
+            reported
+                .transaction
+                .last_meter_sample
+                .map(|sample| sample.energy_wh),
+            Some(4_200)
+        );
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            crate::state::ConnectorState::Charging
+        );
+        assert!(
+            store.load(0, 0).await.is_some(),
+            "a resumed session's record is its ongoing durability, not a leftover"
+        );
+    }
+
+    /// Resume is per-connector: the connector not in the `resume` list still gets the ordinary
+    /// `PowerLoss` close-out, including having its record cleared.
+    #[tokio::test]
+    async fn recovery_clears_only_the_records_it_closes_out() {
+        let executor = crate::executor::TokioExecutor;
+        let actor = ChargePointActor::spawn([2], &executor);
+        let mut recovered_events = actor.subscribe_transaction_events();
+        let store = TransactionStore::new(InMemoryStorage::new());
+        store.save(&record(Some(4_200))).await;
+        let mut other = record(Some(900));
+        other.connector_id = 1;
+        store.save(&other).await;
+
+        assert_eq!(
+            restore_transactions_with_resume(&actor, &store, &[(0, 1)]).await,
+            2
+        );
+
+        assert_eq!(
+            store.load(0, 0).await,
+            None,
+            "the closed-out record must be cleared"
+        );
+        assert!(
+            store.load(0, 1).await.is_some(),
+            "the resumed record must survive"
+        );
+        let mut kinds: Vec<(usize, TransactionEventKind)> = Vec::new();
+        for _ in 0..2 {
+            let reported = recovered_events.recv().await.expect("a recovery event");
+            kinds.push((reported.connector_id, reported.kind));
+        }
+        assert!(
+            kinds
+                .iter()
+                .any(|(connector, kind)| *connector == 0 && *kind == TransactionEventKind::Ended)
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|(connector, kind)| *connector == 1 && *kind == TransactionEventKind::Started)
+        );
+    }
+
+    /// The `Started` a resumed transaction re-emits is not a new session: the start time and
+    /// meter baseline established before the reboot carry forward into the rewritten record
+    /// rather than being restamped.
+    #[test]
+    fn a_resumed_start_keeps_the_persisted_start_time_and_meter_baseline() {
+        let clock = FixedClock(crate::clock::unsynchronized_before() + ChronoDuration::days(2));
+        let mut previous = record(Some(4_200));
+        previous.started_at = Some(crate::clock::unsynchronized_before() + ChronoDuration::days(1));
+        previous.meter_start = Some(MeterSample {
+            energy_wh: 1_000,
+            ..Default::default()
+        });
+
+        let next = next_record(
+            Some(&previous),
+            &occurred(TransactionEventKind::Started, Some(4_200)),
+            &clock,
+        );
+
+        assert_eq!(next.started_at, previous.started_at);
+        assert_eq!(next.meter_start.map(|sample| sample.energy_wh), Some(1_000));
+    }
+
+    /// The end-to-end version of the above: the record a resumed transaction kept is picked up
+    /// by the persistence task's storage fallback (its in-memory shadow starts empty every
+    /// boot), so the `Started` the restore emits rewrites the record with the original start
+    /// time still intact.
+    #[tokio::test]
+    async fn a_resumed_transaction_rewrites_its_record_with_its_start_time_intact() {
+        let storage = alloc::sync::Arc::new(InMemoryStorage::new());
+        let store = TransactionStore::new(storage.clone());
+        let mut persisted = record(Some(4_200));
+        let started_at = SystemClock.now();
+        persisted.started_at = Some(started_at);
+        persisted.meter_start = Some(MeterSample {
+            energy_wh: 1_000,
+            ..Default::default()
+        });
+        store.save(&persisted).await;
+
+        let executor = crate::executor::TokioExecutor;
+        let actor = ChargePointActor::spawn([1], &executor);
+        let events = actor.subscribe_transaction_events();
+        let persistence_store = TransactionStore::new(storage.clone());
+        tokio::spawn(async move {
+            run_transaction_persistence(events, &persistence_store, &SystemClock).await;
+        });
+
+        restore_transactions_with_resume(&actor, &store, &[(0, 0)]).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        let rewritten = store
+            .load(0, 0)
+            .await
+            .expect("the resumed transaction's record");
+        assert_eq!(rewritten.started_at, Some(started_at));
+        assert_eq!(
+            rewritten.meter_start.map(|sample| sample.energy_wh),
+            Some(1_000)
+        );
     }
 
     /// Drives connector 0 of `actor` into a live charging transaction reporting `energy_wh`.

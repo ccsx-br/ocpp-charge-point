@@ -53,11 +53,11 @@ use crate::persistence::{
     flush_and_persist_status_notification_queue, flush_and_persist_transaction_event_queue,
     restore_authorization_cache, restore_device_model, restore_network_profiles,
     restore_security_event_queue, restore_security_log, restore_status_notification_queue,
-    restore_transaction_event_queue, restore_transactions, run_authorization_cache_persistence,
-    run_device_model_persistence, run_network_profile_persistence,
-    run_persisted_security_event_queue, run_persisted_status_notification_queue,
-    run_persisted_transaction_event_queue, run_security_log_persistence,
-    run_transaction_persistence,
+    restore_transaction_event_queue, restore_transactions_with_resume,
+    run_authorization_cache_persistence, run_device_model_persistence,
+    run_network_profile_persistence, run_persisted_security_event_queue,
+    run_persisted_status_notification_queue, run_persisted_transaction_event_queue,
+    run_security_log_persistence, run_transaction_persistence,
 };
 // Split out from the `crate::persistence` import above (C4.2): each of these backs exactly one
 // feature-gated registration method below, so importing it unconditionally would leave an unused
@@ -2185,7 +2185,36 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
     ///
     /// `clock` stamps each record's start time - [`crate::clock::SystemClock`] on std, an
     /// RTC-backed [`crate::clock::Clock`] on embedded.
-    pub async fn transaction_persistence<S, K>(mut self, storage: S, clock: K) -> Self
+    ///
+    /// Equivalent to [`Self::transaction_persistence_with_store`] with a default
+    /// [`TransactionStore`] over `storage` and nothing to resume.
+    pub async fn transaction_persistence<S, K>(self, storage: S, clock: K) -> Self
+    where
+        S: crate::hardware::Storage + Send + Sync + 'static,
+        K: crate::clock::Clock + Send + Sync + 'static,
+    {
+        self.transaction_persistence_with_store(TransactionStore::new(storage), clock, &[])
+            .await
+    }
+
+    /// [`Self::transaction_persistence`] over a caller-configured [`TransactionStore`] (e.g.
+    /// [`TransactionStore::with_meter_write_threshold_wh`], or [`TransactionStore::new_atomic`]),
+    /// plus a per-connector resume decision for the boot-time recovery.
+    ///
+    /// `resume` lists the `(evse_id, connector_id)` pairs whose recovered transaction is still
+    /// physically alive - the integrator's assertion that the hardware kept charging while the
+    /// firmware was off (see [`crate::state::RecoveredTransaction::resume`]). Those transactions
+    /// are re-installed live rather than closed out with `PowerLoss`, and their records stay in
+    /// storage as the running sessions' durability. Pass `&[]` for the ordinary close-out.
+    ///
+    /// `clock` stamps each record's start time - [`crate::clock::SystemClock`] on std, an
+    /// RTC-backed [`crate::clock::Clock`] on embedded.
+    pub async fn transaction_persistence_with_store<S, K>(
+        mut self,
+        store: TransactionStore<S>,
+        clock: K,
+        resume: &[(usize, usize)],
+    ) -> Self
     where
         S: crate::hardware::Storage + Send + Sync + 'static,
         K: crate::clock::Clock + Send + Sync + 'static,
@@ -2197,9 +2226,9 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
             return self;
         };
 
-        let store = Arc::new(TransactionStore::new(storage));
+        let store = Arc::new(store);
         // Before spawning the writer: recovery must not race a live write against the same keys.
-        restore_transactions(&self.runtime.actor(), &store).await;
+        restore_transactions_with_resume(&self.runtime.actor(), &store, resume).await;
 
         self.executor.spawn(Box::pin(async move {
             run_transaction_persistence(events, &store, &clock).await;

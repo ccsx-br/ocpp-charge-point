@@ -2813,12 +2813,27 @@ pub(crate) mod ocpp_1_6 {
     /// docs. `C` defaults to nothing in particular; embedded/no_std callers construct with
     /// [`Self::with_clock`] and an RTC-backed `Clock`, while `std` callers keep using
     /// [`Self::new`] (sourcing the timestamp from [`crate::clock::SystemClock`]) unchanged.
-    pub struct Ocpp1_6TransactionNotifier<C> {
+    ///
+    /// `S` is an optional [`crate::hardware::Storage`] holding the CSMS-assigned transaction ids
+    /// durably ([`Self::with_id_store`]) - [`crate::hardware::NoStorage`] by default, which keeps
+    /// the historical RAM-only behaviour where a reboot loses every id the CSMS assigned.
+    pub struct Ocpp1_6TransactionNotifier<C, S = crate::hardware::NoStorage> {
         client: OCPP1_6Client,
         connector_counts: Vec<usize>,
         csms_transaction_ids:
             BlockingMutex<CriticalSectionRawMutex, RefCell<BTreeMap<TransactionId, i64>>>,
         clock: C,
+        id_store: S,
+    }
+
+    /// The storage-key prefix the persisted CSMS-assigned transaction ids live under - a sibling
+    /// of `crate::persistence`'s `ocpp-cp/txn` record keys, kept separate on purpose: the record
+    /// is the transaction itself, this is the id the CSMS gave it, and the two have different
+    /// writers and lifetimes.
+    const CSMS_ID_KEY_PREFIX: &str = "ocpp-cp/txn-csms-id";
+
+    fn csms_id_key(transaction_id: TransactionId) -> alloc::string::String {
+        alloc::format!("{CSMS_ID_KEY_PREFIX}/{}", transaction_id.0)
     }
 
     impl<C: crate::clock::Clock> Ocpp1_6TransactionNotifier<C> {
@@ -2835,6 +2850,90 @@ pub(crate) mod ocpp_1_6 {
                 connector_counts: connector_counts.into_iter().collect(),
                 csms_transaction_ids: BlockingMutex::new(RefCell::new(BTreeMap::new())),
                 clock,
+                id_store: crate::hardware::NoStorage,
+            }
+        }
+
+        /// Gives the notifier a durable home for the CSMS-assigned transaction ids -
+        /// `ocpp-cp/txn-csms-id/<internal id>` holding the 8-byte little-endian `transactionId`
+        /// from `StartTransaction.conf`.
+        ///
+        /// Two behaviours change:
+        ///
+        /// - **Mid-session reboot.** A reboot loses the RAM id cache; without this every later
+        ///   `MeterValues`/`StopTransaction` would have no `transactionId` to report against.
+        ///   `Updated`/`Ended` fall back to the store on a cache miss (seeding the cache again),
+        ///   and `Ended` removes the key once the session is reported closed.
+        /// - **Session resume.** A `Started` that finds an id already stored under its
+        ///   transaction id is a *resumed* session - `StartTransaction` was already called and
+        ///   acknowledged before the reboot, and calling it again would mint a second CSMS-side
+        ///   transaction for the same physical session. The stored id seeds the cache and the
+        ///   wire call is skipped; the CSMS simply sees the session continue.
+        ///
+        /// Storage failures degrade exactly like `crate::persistence`'s: logged, and the
+        /// notifier carries on with RAM-only ids.
+        pub fn with_id_store<S: crate::hardware::Storage>(
+            self,
+            store: S,
+        ) -> Ocpp1_6TransactionNotifier<C, S> {
+            Ocpp1_6TransactionNotifier {
+                client: self.client,
+                connector_counts: self.connector_counts,
+                csms_transaction_ids: self.csms_transaction_ids,
+                clock: self.clock,
+                id_store: store,
+            }
+        }
+    }
+
+    impl<C, S: crate::hardware::Storage> Ocpp1_6TransactionNotifier<C, S> {
+        /// Reads a persisted CSMS-assigned transaction id, decoding the 8-byte little-endian
+        /// value [`Self::with_id_store`] documents. `None` covers absent, unreadable and
+        /// malformed alike - all logged rather than propagated, per this crate's storage stance.
+        async fn stored_csms_id(&self, key: &str) -> Option<i64> {
+            match self.id_store.get(key).await {
+                Ok(Some(bytes)) => match <[u8; 8]>::try_from(bytes.as_slice()) {
+                    Ok(bytes) => Some(i64::from_le_bytes(bytes)),
+                    Err(_) => {
+                        tracing::warn!(
+                            key,
+                            "a persisted CSMS transaction id is malformed; ignoring it"
+                        );
+                        None
+                    }
+                },
+                Ok(None) => None,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        key,
+                        "failed to read a persisted CSMS transaction id; treating it as absent"
+                    );
+                    None
+                }
+            }
+        }
+
+        /// Persists `csms_id` under `key`; a failure is logged and the notifier carries on
+        /// RAM-only (the session still reports correctly until the next reboot).
+        async fn persist_csms_id(&self, key: &str, csms_id: i64) {
+            if let Err(err) = self.id_store.set(key, &csms_id.to_le_bytes()).await {
+                tracing::warn!(
+                    error = %err,
+                    key,
+                    "failed to persist a CSMS transaction id; a reboot would lose it"
+                );
+            }
+        }
+
+        /// Removes `key`'s persisted id; a missing key is not an error.
+        async fn remove_stored_csms_id(&self, key: &str) {
+            if let Err(err) = self.id_store.remove(key).await {
+                tracing::warn!(
+                    error = %err,
+                    key,
+                    "failed to remove a persisted CSMS transaction id"
+                );
             }
         }
     }
@@ -2857,7 +2956,7 @@ pub(crate) mod ocpp_1_6 {
     // produced from `self.clock` - see `crate::clock::is_synchronized`'s docs for the policy on
     // an unsynchronized reading (send it as-is, warn, never fabricate or drop it).
     mod with_clock {
-        use super::{Ocpp1_6TransactionNotifier, map_stop_reason, sampled_values};
+        use super::{Ocpp1_6TransactionNotifier, csms_id_key, map_stop_reason, sampled_values};
         use crate::clock::{Clock, is_synchronized};
         use crate::id_tag::map_id_tag;
         use crate::state::{Transaction, TransactionEventKind};
@@ -2877,7 +2976,9 @@ pub(crate) mod ocpp_1_6 {
         /// different one. Without this a 1.6J charge point could not use the offline queues at
         /// all, since those flush on reconnect.
         #[async_trait::async_trait]
-        impl<C: Clock + Send + Sync> crate::connection::ReconnectHandler for Ocpp1_6TransactionNotifier<C> {
+        impl<C: Clock + Send + Sync, S: Send + Sync> crate::connection::ReconnectHandler
+            for Ocpp1_6TransactionNotifier<C, S>
+        {
             async fn register_reconnect_handler<F, FF>(&self, callback: F)
             where
                 F: FnMut() -> FF + Send + Sync + 'static,
@@ -2892,7 +2993,9 @@ pub(crate) mod ocpp_1_6 {
         }
 
         #[async_trait::async_trait]
-        impl<C: Clock + Send + Sync> TransactionNotifier for Ocpp1_6TransactionNotifier<C> {
+        impl<C: Clock + Send + Sync, S: crate::hardware::Storage + Send + Sync> TransactionNotifier
+            for Ocpp1_6TransactionNotifier<C, S>
+        {
             type Error = ClientError<OCPP1_6Error>;
 
             /// `offline` is ignored: 1.6J's `StartTransaction`/`MeterValues`/`StopTransaction`
@@ -2929,6 +3032,18 @@ pub(crate) mod ocpp_1_6 {
 
                 match kind {
                     TransactionEventKind::Started => {
+                        let key = csms_id_key(transaction.id);
+                        // A stored id under this transaction's key means `StartTransaction`
+                        // already ran and was acknowledged before a reboot - this is a resumed
+                        // session (see `PersistedTransactionsRestored`/`with_id_store`), and a
+                        // second wire call would mint a second CSMS-side transaction for one
+                        // physical session. Seed the RAM cache and acknowledge without calling.
+                        if let Some(csms_id) = self.stored_csms_id(&key).await {
+                            self.csms_transaction_ids.lock(|cache| {
+                                cache.borrow_mut().insert(transaction.id, csms_id);
+                            });
+                            return Ok(TransactionEventOutcome::acknowledged());
+                        }
                         let response = self
                             .client
                             .send_start_transaction(StartTransactionRequest {
@@ -2944,6 +3059,9 @@ pub(crate) mod ocpp_1_6 {
                                 .borrow_mut()
                                 .insert(transaction.id, response.transaction_id);
                         });
+                        // Durable *after* the wire call, never before: persisting earlier would
+                        // risk a stored id no CSMS ever acknowledged being read as a resume.
+                        self.persist_csms_id(&key, response.transaction_id).await;
                         // 1.6J's `idTagInfo` is where a CSMS refuses the tag a session is running
                         // under - the same E05 decision 2.x carries on `TransactionEventResponse`.
                         return Ok(TransactionEventOutcome::with_id_token_status(
@@ -2957,9 +3075,24 @@ pub(crate) mod ocpp_1_6 {
                             // regardless (see `super::ocpp_2_1`'s `Updated` handling).
                             return Ok(TransactionEventOutcome::acknowledged());
                         };
-                        let csms_transaction_id = self
+                        let csms_transaction_id = match self
                             .csms_transaction_ids
-                            .lock(|cache| cache.borrow().get(&transaction.id).copied());
+                            .lock(|cache| cache.borrow().get(&transaction.id).copied())
+                        {
+                            Some(csms_id) => Some(csms_id),
+                            // The RAM cache lost this id to a mid-session reboot: the store is
+                            // the fallback, and a hit re-seeds the cache for the next call.
+                            None => {
+                                let stored =
+                                    self.stored_csms_id(&csms_id_key(transaction.id)).await;
+                                if let Some(csms_id) = stored {
+                                    self.csms_transaction_ids.lock(|cache| {
+                                        cache.borrow_mut().insert(transaction.id, csms_id);
+                                    });
+                                }
+                                stored
+                            }
+                        };
                         self.client
                             .send_meter_values(MeterValuesRequest {
                                 connector_id,
@@ -2972,13 +3105,21 @@ pub(crate) mod ocpp_1_6 {
                             .await?;
                     }
                     TransactionEventKind::Ended => {
-                        let csms_transaction_id = self
+                        let csms_transaction_id = match self
                             .csms_transaction_ids
-                            .lock(|cache| cache.borrow_mut().remove(&transaction.id));
+                            .lock(|cache| cache.borrow_mut().remove(&transaction.id))
+                        {
+                            Some(csms_id) => Some(csms_id),
+                            // Same reboot-loses-the-cache fallback as `Updated`.
+                            None => self.stored_csms_id(&csms_id_key(transaction.id)).await,
+                        };
                         let Some(csms_transaction_id) = csms_transaction_id else {
                             // No `StartTransaction` on record for this transaction - shouldn't
                             // happen (`Started` always precedes `Ended` for the same
                             // transaction), but there's nothing to stop without the CSMS's id.
+                            // Still drop any stale persisted id so it can't mis-seed later.
+                            self.remove_stored_csms_id(&csms_id_key(transaction.id))
+                                .await;
                             return Ok(TransactionEventOutcome::acknowledged());
                         };
                         let response = self
@@ -2992,6 +3133,10 @@ pub(crate) mod ocpp_1_6 {
                                 transaction_id: csms_transaction_id,
                             })
                             .await?;
+                        // The session is closed on the CSMS side: the durable id's job is done,
+                        // and leaving it would read as a phantom resume on the next boot.
+                        self.remove_stored_csms_id(&csms_id_key(transaction.id))
+                            .await;
                         // Optional on a `StopTransaction` response, and moot by then - the
                         // transaction is already over - but read rather than discarded so the
                         // three event kinds answer the same question the same way.
