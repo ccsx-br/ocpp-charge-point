@@ -265,12 +265,16 @@ pub enum ChargePointEvent {
     /// event so recovery can never be observed half-done. See
     /// [`crate::persistence::restore_transactions`] and `docs/PRODUCTION-ROADMAP.md` §7.4 (E4.1).
     ///
-    /// Each entry is *closed out* rather than resumed: a `TransactionEvent(Ended)` with
-    /// [`StopReason::PowerLoss`] is emitted per recovered transaction, carrying the last meter
-    /// reading that reached storage before the power cut, so the CSMS can still bill the energy
-    /// delivered. Resuming across a reboot would require asserting that the EV stayed connected
-    /// and energy kept flowing while the firmware was not running, which no hardware binding in
-    /// [`crate::hardware`] can currently attest to.
+    /// Each entry is *closed out* rather than resumed by default: a `TransactionEvent(Ended)`
+    /// with [`StopReason::PowerLoss`] is emitted per recovered transaction, carrying the last
+    /// meter reading that reached storage before the power cut, so the CSMS can still bill the
+    /// energy delivered. Resuming across a reboot requires asserting that the EV stayed
+    /// connected and energy kept flowing while the firmware was not running, which no hardware
+    /// binding in [`crate::hardware`] can currently attest to - an integrator that *can* attest
+    /// to it (e.g. a base board that charges autonomously) passes
+    /// [`RecoveredTransaction::resume`] via
+    /// [`crate::persistence::restore_transactions_with_resume`], and that entry is re-installed
+    /// as a live transaction instead.
     PersistedTransactionsRestored {
         /// The transaction-id counter as of the last persisted transaction start, so a recovered
         /// charge point never reissues an id the CSMS has already seen. Applied as a floor, not
@@ -1095,6 +1099,24 @@ pub struct RecoveredTransaction {
     pub connector_id: usize,
     /// The transaction as it was last persisted before power was lost.
     pub transaction: Transaction,
+    /// Whether this transaction is *resumed* rather than closed out.
+    ///
+    /// `false` (the ordinary case - see
+    /// [`crate::persistence::restore_transactions`]) closes the transaction out
+    /// with [`StopReason::PowerLoss`]: the charge point cannot assert what the
+    /// hardware did while it was off, so the session is billed up to the last
+    /// persisted reading and ended.
+    ///
+    /// `true` means an integrator *has* asserted the session is still alive -
+    /// e.g. a base board that keeps charging autonomously while the module
+    /// reboots, identified out-of-band (see
+    /// [`crate::persistence::restore_transactions_with_resume`]). The
+    /// transaction is installed back onto its connector, the connector moves to
+    /// [`ConnectorState::Charging`], and a fresh `TransactionEvent(Started)` is
+    /// emitted so version adapters re-announce (or, for OCPP 1.6J, silently
+    /// re-arm) the session. No hardware command is emitted - a resumed session's
+    /// contactor never opened.
+    pub resume: bool,
 }
 
 /// One reservation read back from durable storage at boot, carried by

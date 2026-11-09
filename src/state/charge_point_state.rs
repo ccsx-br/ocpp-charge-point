@@ -808,6 +808,33 @@ impl ChargePointState {
                         );
                         continue;
                     }
+                    if recovered.resume {
+                        // The integrator asserted the session is still alive (see
+                        // `RecoveredTransaction::resume`): the contactor never opened, so the
+                        // transaction goes back onto its connector and the connector is
+                        // Charging again. No `ConnectorCommand` is emitted - issuing one here
+                        // would re-command hardware that never stopped doing the right thing.
+                        // A fresh `Started` re-announces the session to subscribers (version
+                        // adapters); the original transaction id is kept - it is the one the
+                        // CSMS already knows, and `seq_no` advances rather than restarts.
+                        let mut transaction = recovered.transaction;
+                        transaction.seq_no += 1;
+                        self.evses[recovered.evse_id].connectors[recovered.connector_id] =
+                            ConnectorState::Charging;
+                        self.evses[recovered.evse_id].transactions[recovered.connector_id] =
+                            Some(transaction.clone());
+                        recovered_any = true;
+                        effects.push(ChargePointEffect::TransactionEvent(
+                            TransactionEventOccurred {
+                                evse_id: recovered.evse_id,
+                                connector_id: recovered.connector_id,
+                                kind: TransactionEventKind::Started,
+                                transaction,
+                                offline: false,
+                            },
+                        ));
+                        continue;
+                    }
                     let mut transaction = recovered.transaction;
                     transaction.stop_reason = Some(StopReason::PowerLoss);
                     transaction.seq_no += 1;
@@ -6797,6 +6824,7 @@ mod tests {
                 evse_id: 0,
                 connector_id: 0,
                 transaction: interrupted_transaction(),
+                resume: false,
             }],
         });
 
@@ -6820,6 +6848,54 @@ mod tests {
         // Closed out, not resumed - nothing is left occupying the connector's transaction slot.
         assert_eq!(state.evses[0].transactions[0], None);
         assert!(effects.contains(&ChargePointEffect::StateChanged));
+    }
+
+    /// The `resume` half of recovery: an integrator that attested the hardware session is still
+    /// alive gets the transaction re-installed live - connector `Charging`, transaction in its
+    /// slot, a fresh `Started` to re-announce it - rather than a `PowerLoss` close-out.
+    #[test]
+    fn a_recovered_transaction_marked_for_resume_is_reinstalled_as_started() {
+        let mut state = ChargePointState::new([1]);
+
+        let effects = state.apply(ChargePointEvent::PersistedTransactionsRestored {
+            next_transaction_id: 8,
+            transactions: alloc::vec![crate::state::RecoveredTransaction {
+                evse_id: 0,
+                connector_id: 0,
+                transaction: interrupted_transaction(),
+                resume: true,
+            }],
+        });
+
+        // The transaction is back on its connector, with `seqNo` continuing rather than
+        // restarting - this is the same session the CSMS already knows, not a new one.
+        let expected = Transaction {
+            seq_no: 13,
+            ..interrupted_transaction()
+        };
+        assert_eq!(state.evses[0].transactions[0], Some(expected.clone()));
+        assert_eq!(
+            state.evses[0].connectors[0],
+            ConnectorState::Charging,
+            "a resumed session's contactor never opened"
+        );
+        assert!(effects.contains(&ChargePointEffect::TransactionEvent(
+            TransactionEventOccurred {
+                evse_id: 0,
+                connector_id: 0,
+                kind: TransactionEventKind::Started,
+                transaction: expected,
+                offline: false,
+            }
+        )));
+        // And critically: no hardware command - the board is already energized, so issuing a
+        // `ConnectorCommand` here would command a contactor that never opened.
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, ChargePointEffect::HardwareCommand(_))),
+            "resume must not re-command hardware: {effects:?}"
+        );
     }
 
     #[test]
@@ -6881,6 +6957,7 @@ mod tests {
                 evse_id: 4,
                 connector_id: 9,
                 transaction: interrupted_transaction(),
+                resume: false,
             }],
         });
 
