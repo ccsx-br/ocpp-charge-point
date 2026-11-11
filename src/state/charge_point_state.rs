@@ -1334,6 +1334,12 @@ impl ChargePointState {
     /// restore, or by the network-switch logic, and one sync point cannot drift where several
     /// mutation sites would.
     fn sync_network_configuration_variables(&mut self) {
+        // A model built `DeviceModel::empty(0)` can never hold a variable: the deployment
+        // declared it has no reporting surface, so mirroring the profile into it would only
+        // produce a refused registration (and a warn) per event for the life of the process.
+        if self.device_model.max_variables() == 0 {
+            return;
+        }
         let wanted: Vec<(String, NetworkConnectionProfileSnapshot)> = self
             .network_profiles
             .slots()
