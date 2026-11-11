@@ -185,20 +185,9 @@ pub struct StateLimits {
     /// it is refused with [`DERControlRejection::TooManyControls`](crate::state::DERControlRejection::TooManyControls);
     /// replacing an already-installed control's id always succeeds. Clamped to at least 1.
     pub max_der_controls: usize,
-    /// Whether the device model registers the spec-default variable catalog
-    /// ([`crate::state::DeviceModel::register_defaults`]) at construction. `true` gives the full
-    /// 2.x reporting surface - `GetVariables`/`GetBaseReport` describe every built-in variable.
-    /// `false` builds the topology-only model ([`crate::state::DeviceModel::topology_only`]): the
-    /// station/EVSE/connector availability pairs and plug-retention-lock variables, which the
-    /// state machine writes through whatever the negotiated version, and nothing else.
-    ///
-    /// This is a construction-time choice rather than a bound - `max_device_model_variables` is
-    /// deliberately raised to fit the defaults, so it cannot shrink them. A deployment that will
-    /// only ever negotiate OCPP 1.6J should set this `false`: the catalog is ~55 `String`-backed
-    /// `BTreeMap` entries a 1.6 CSMS can never query, and on a memory-constrained build holding
-    /// it - and cloning it again into the actor's watch channel - can be the difference between
-    /// fitting in RAM and not.
-    pub default_variables: bool,
+    /// Which variable catalog [`crate::state::DeviceModel`] is built with - see
+    /// [`DeviceModelShape`].
+    pub device_model_shape: DeviceModelShape,
 }
 
 impl StateLimits {
@@ -217,13 +206,13 @@ impl StateLimits {
             max_periodic_event_streams: DEFAULT_MAX_PERIODIC_EVENT_STREAMS,
             max_pending_battery_swaps: DEFAULT_MAX_PENDING_BATTERY_SWAPS,
             max_der_controls: DEFAULT_MAX_DER_CONTROLS,
-            default_variables: true,
+            device_model_shape: DeviceModelShape::Full,
         }
     }
 
-    /// Overrides [`Self::default_variables`].
-    pub const fn with_default_variables(mut self, enabled: bool) -> Self {
-        self.default_variables = enabled;
+    /// Overrides [`Self::device_model_shape`].
+    pub const fn with_device_model_shape(mut self, shape: DeviceModelShape) -> Self {
+        self.device_model_shape = shape;
         self
     }
 
@@ -292,6 +281,32 @@ impl StateLimits {
         self.max_pending_battery_swaps = max;
         self
     }
+}
+
+/// Which variable catalog [`crate::state::DeviceModel`] registers when [`ChargePointState`] is
+/// constructed.
+///
+/// This is a construction-time choice rather than a bound - `StateLimits::max_device_model_variables`
+/// is deliberately raised to fit the built-in registrations, so it cannot shrink them. A deployment
+/// that will only ever negotiate OCPP 1.6J has no `GetVariables`/`GetBaseReport` traffic to answer,
+/// and on a memory-constrained build the `String`-backed `BTreeMap` entries a 1.6 CSMS can never
+/// query - duplicated into the actor's watch channel and cloned again on every published event -
+/// can be the difference between fitting in RAM and not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeviceModelShape {
+    /// The full spec-default catalog plus the topology-mandated variables
+    /// ([`crate::state::DeviceModel::with_topology`]): the ~55-variable 2.x reporting surface
+    /// `GetVariables`/`GetBaseReport` describe to a CSMS.
+    #[default]
+    Full,
+    /// Only the topology-mandated variables ([`crate::state::DeviceModel::topology_only`]): the
+    /// station/EVSE/connector availability pairs and the per-connector plug-retention-lock
+    /// variable, which the state machine writes through whatever the negotiated version.
+    TopologyOnly,
+    /// No variables at all ([`crate::state::DeviceModel::empty`]): the smallest possible model,
+    /// for deployments where nothing - not a 1.6 CSMS, not an internal consumer - ever reads it.
+    /// Availability writes still flow through `set_attribute_value` and are quietly ignored.
+    Empty,
 }
 
 impl Default for StateLimits {
