@@ -185,6 +185,20 @@ pub struct StateLimits {
     /// it is refused with [`DERControlRejection::TooManyControls`](crate::state::DERControlRejection::TooManyControls);
     /// replacing an already-installed control's id always succeeds. Clamped to at least 1.
     pub max_der_controls: usize,
+    /// Whether the device model registers the spec-default variable catalog
+    /// ([`crate::state::DeviceModel::register_defaults`]) at construction. `true` gives the full
+    /// 2.x reporting surface - `GetVariables`/`GetBaseReport` describe every built-in variable.
+    /// `false` builds the topology-only model ([`crate::state::DeviceModel::topology_only`]): the
+    /// station/EVSE/connector availability pairs and plug-retention-lock variables, which the
+    /// state machine writes through whatever the negotiated version, and nothing else.
+    ///
+    /// This is a construction-time choice rather than a bound - `max_device_model_variables` is
+    /// deliberately raised to fit the defaults, so it cannot shrink them. A deployment that will
+    /// only ever negotiate OCPP 1.6J should set this `false`: the catalog is ~55 `String`-backed
+    /// `BTreeMap` entries a 1.6 CSMS can never query, and on a memory-constrained build holding
+    /// it - and cloning it again into the actor's watch channel - can be the difference between
+    /// fitting in RAM and not.
+    pub default_variables: bool,
 }
 
 impl StateLimits {
@@ -203,7 +217,14 @@ impl StateLimits {
             max_periodic_event_streams: DEFAULT_MAX_PERIODIC_EVENT_STREAMS,
             max_pending_battery_swaps: DEFAULT_MAX_PENDING_BATTERY_SWAPS,
             max_der_controls: DEFAULT_MAX_DER_CONTROLS,
+            default_variables: true,
         }
+    }
+
+    /// Overrides [`Self::default_variables`].
+    pub const fn with_default_variables(mut self, enabled: bool) -> Self {
+        self.default_variables = enabled;
+        self
     }
 
     /// Overrides [`Self::max_periodic_event_streams`].
