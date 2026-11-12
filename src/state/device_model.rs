@@ -221,11 +221,40 @@ impl DeviceModel {
     /// defaults *and* these occupy if `max_variables` is smaller - a limit that dropped the
     /// components OCPP requires would bound nothing worth bounding.
     pub fn with_topology(max_variables: usize, connector_counts: &[usize]) -> Self {
+        Self::with_topology_opts(max_variables, connector_counts, true)
+    }
+
+    /// [`with_topology`](Self::with_topology) without the spec-default variable catalog: only the
+    /// topology-mandated components (the station/EVSE/connector availability pairs and the
+    /// per-connector plug-retention-lock variable - see [`Self::register_topology_defaults`]) are
+    /// registered.
+    ///
+    /// The `DEFAULT_VARIABLES` set exists so `GetVariables`/`GetBaseReport` can describe the
+    /// charge point to a 2.x CSMS; a deployment that will only ever negotiate OCPP 1.6J has no
+    /// such traffic to answer, and on a memory-constrained build the catalog's tens of
+    /// thousands of bytes of `String`/`BTreeMap` allocations are pure cost. Skipping them here -
+    /// rather than bounding them away via `max_variables`, which is deliberately raised to fit
+    /// the defaults - is the honest way to shrink the model.
+    ///
+    /// `max_variables` still bounds every later registration (`capability_gate_events`, restores
+    /// from persistence, CSMS-driven `VariableRegistered`s); it is raised only to fit the
+    /// topology variables, never a catalog that was never registered.
+    pub fn topology_only(max_variables: usize, connector_counts: &[usize]) -> Self {
+        Self::with_topology_opts(max_variables, connector_counts, false)
+    }
+
+    fn with_topology_opts(
+        max_variables: usize,
+        connector_counts: &[usize],
+        register_defaults: bool,
+    ) -> Self {
         let mut model = Self {
             components: BTreeMap::new(),
             max_variables: usize::MAX,
         };
-        model.register_defaults();
+        if register_defaults {
+            model.register_defaults();
+        }
         model.register_topology_defaults(connector_counts);
         model.max_variables = max_variables.max(model.len()).max(1);
         model
@@ -1998,6 +2027,49 @@ mod tests {
         let expected = FRESH_MODEL_VARIABLES
             + AVAILABILITY_VARIABLES_PER_COMPONENT * 5
             + PLUG_RETENTION_LOCK_VARIABLES_PER_CONNECTOR * 3;
+        assert_eq!(model.len(), expected);
+        assert_eq!(model.max_variables(), expected);
+    }
+
+    /// `topology_only` skips the spec-default variable catalog entirely - a charge point that
+    /// will never negotiate a 2.x protocol version has no `GetVariables`/`GetBaseReport` traffic
+    /// to answer, so holding ~55 reporting variables it can never serve is pure RAM. The
+    /// topology variables stay, because the state machine writes availability through them
+    /// regardless of version.
+    #[test]
+    fn topology_only_registers_only_the_topology_variables() {
+        let model = DeviceModel::topology_only(64, &[1]);
+
+        let expected = STATION_AVAILABILITY_VARIABLES
+            + AVAILABILITY_VARIABLES_PER_COMPONENT * 2
+            + PLUG_RETENTION_LOCK_VARIABLES_PER_CONNECTOR;
+        assert_eq!(model.len(), expected);
+        assert_eq!(model.max_variables(), 64);
+        assert!(
+            model
+                .iter()
+                .all(|(component, variable, _)| matches!(
+                    component.name.as_str(),
+                    AVAILABILITY_COMPONENT_CHARGE_POINT
+                        | AVAILABILITY_COMPONENT_EVSE
+                        | AVAILABILITY_COMPONENT_CONNECTOR
+                        | PLUG_RETENTION_LOCK_COMPONENT
+                ) && matches!(
+                    variable.name.as_str(),
+                    "AvailabilityState" | "Available" | "Problem"
+                ))
+        );
+    }
+
+    /// The bound is still honoured when it exceeds the topology - unlike `with_topology`, there
+    /// are no defaults to raise it for.
+    #[test]
+    fn topology_only_does_not_raise_the_bound_for_skipped_defaults() {
+        let model = DeviceModel::topology_only(0, &[1]);
+
+        let expected = STATION_AVAILABILITY_VARIABLES
+            + AVAILABILITY_VARIABLES_PER_COMPONENT * 2
+            + PLUG_RETENTION_LOCK_VARIABLES_PER_CONNECTOR;
         assert_eq!(model.len(), expected);
         assert_eq!(model.max_variables(), expected);
     }

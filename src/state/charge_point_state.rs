@@ -367,10 +367,20 @@ impl ChargePointState {
             // charge point, on every EVSE and on every connector (CV1.1), and those components
             // can only be named once the topology is known. See
             // `DeviceModel::register_topology_defaults`.
-            device_model: DeviceModel::with_topology(
-                limits.max_device_model_variables,
-                &connector_counts,
-            ),
+            // `default_variables` picks the model shape: the full 2.x reporting catalog, or the
+            // topology-only model for deployments (1.6-only, memory-constrained) that will never
+            // serve `GetVariables`/`GetBaseReport` - see `StateLimits::default_variables`.
+            device_model: if limits.default_variables {
+                DeviceModel::with_topology(
+                    limits.max_device_model_variables,
+                    &connector_counts,
+                )
+            } else {
+                DeviceModel::topology_only(
+                    limits.max_device_model_variables,
+                    &connector_counts,
+                )
+            },
             capabilities: Capabilities::default(),
             network_profiles: NetworkProfileStore::with_max_slots(limits.max_network_profile_slots),
             authorization_cache: AuthorizationCache::with_max_entries(
@@ -3096,6 +3106,28 @@ mod tests {
     use crate::state::{
         ChargePointEffect, EvseStatus, IdToken, IdTokenKind, TransactionUpdateReason,
     };
+
+    /// `StateLimits::default_variables = false` builds the device model without the spec-default
+    /// catalog - the ~55-variable 2.x reporting surface a 1.6-only charge point can never serve.
+    /// The topology variables still register, since the state machine writes availability through
+    /// them whatever the negotiated version.
+    #[test]
+    fn with_limits_without_default_variables_keeps_only_the_topology_model() {
+        let state = ChargePointState::with_limits(
+            [1],
+            StateLimits::new().with_default_variables(false),
+        );
+
+        assert!(
+            state
+                .device_model
+                .iter()
+                .all(|(component, _, _)| matches!(
+                    component.name.as_str(),
+                    "ChargingStation" | "EVSE" | "Connector" | "ConnectorPlugRetentionLock"
+                ))
+        );
+    }
 
     #[test]
     fn accepted_registration_records_status_and_makes_the_charge_point_available() {
