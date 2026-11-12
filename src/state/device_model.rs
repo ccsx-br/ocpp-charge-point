@@ -243,6 +243,23 @@ impl DeviceModel {
         Self::with_topology_opts(max_variables, connector_counts, false)
     }
 
+    /// A device model holding no variables at all - not even the topology-mandated availability
+    /// pairs [`with_topology`](Self::with_topology) registers. The state machine's
+    /// `set_attribute_value` writes simply no-op against variables that were never registered,
+    /// so this is the honest shape for a deployment where nothing ever reads the model: a
+    /// 1.6-only charge point has no `GetVariables`/`GetBaseReport` traffic to answer, and on a
+    /// memory-constrained build even the topology pairs are RAM it cannot spare.
+    ///
+    /// `max_variables` still bounds later registrations (`capability_gate_events`, restores from
+    /// persistence, CSMS-driven `VariableRegistered`s); it is *not* raised for anything, since
+    /// nothing is registered.
+    pub fn empty(max_variables: usize) -> Self {
+        Self {
+            components: BTreeMap::new(),
+            max_variables: max_variables.max(1),
+        }
+    }
+
     fn with_topology_opts(
         max_variables: usize,
         connector_counts: &[usize],

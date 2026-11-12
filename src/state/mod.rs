@@ -73,7 +73,7 @@ pub use self::id_token::{IdToken, IdTokenKind};
 pub use self::limits::{
     DEFAULT_MAX_CHARGING_PROFILES, DEFAULT_MAX_DER_CONTROLS, DEFAULT_MAX_DEVICE_MODEL_VARIABLES,
     DEFAULT_MAX_LOCAL_AUTHORIZATION_LIST_ENTRIES, DEFAULT_MAX_PERIODIC_EVENT_STREAMS,
-    DEFAULT_MAX_TARIFFS, DEFAULT_MAX_VARIABLE_MONITORS, StateLimits,
+    DEFAULT_MAX_TARIFFS, DEFAULT_MAX_VARIABLE_MONITORS, DeviceModelShape, StateLimits,
 };
 pub use self::local_authorization_list::{LocalAuthorizationList, LocalListEntry};
 pub use self::meter_sample::MeterSample;

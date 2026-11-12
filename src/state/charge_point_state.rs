@@ -16,7 +16,7 @@ use crate::state::{
     AfrrSignal, AuthorizationCache, AuthorizationRequested, BatterySwapStore, ChargePointEffect,
     ChargePointEvent, ChargingProfileScope, ChargingProfileStore, Component, ConnectorEvent,
     ConnectorState, ConnectorStatus, ConnectorStatusChanged, DERControlStore, DeviceModel,
-    DeviceModelEvent, DisplayMessageStore, EventTrigger, EvseEvent, EvseState, EvseStatus,
+    DeviceModelEvent, DeviceModelShape, DisplayMessageStore, EventTrigger, EvseEvent, EvseState, EvseStatus,
     ExternalChargingLimit, HardwareCommand, IdToken, LocalAuthorizationList, LocalListEntry,
     MeterSample, NetworkProfileStore, PendingReset, PeriodicEventStreamStore, RegistrationStatus,
     ReservationEndReason, ReservationUpdate, ResetKind, ResetTarget, SecurityEvent,
@@ -367,19 +367,22 @@ impl ChargePointState {
             // charge point, on every EVSE and on every connector (CV1.1), and those components
             // can only be named once the topology is known. See
             // `DeviceModel::register_topology_defaults`.
-            // `default_variables` picks the model shape: the full 2.x reporting catalog, or the
-            // topology-only model for deployments (1.6-only, memory-constrained) that will never
-            // serve `GetVariables`/`GetBaseReport` - see `StateLimits::default_variables`.
-            device_model: if limits.default_variables {
-                DeviceModel::with_topology(
+            // `device_model_shape` picks the catalog the model is built with: the full 2.x
+            // reporting surface, the topology-mandated variables only, or nothing at all - see
+            // `DeviceModelShape`. A 1.6-only charge point never serves `GetVariables`/
+            // `GetBaseReport`, so the catalog is dead RAM on a constrained build.
+            device_model: match limits.device_model_shape {
+                DeviceModelShape::Full => DeviceModel::with_topology(
                     limits.max_device_model_variables,
                     &connector_counts,
-                )
-            } else {
-                DeviceModel::topology_only(
+                ),
+                DeviceModelShape::TopologyOnly => DeviceModel::topology_only(
                     limits.max_device_model_variables,
                     &connector_counts,
-                )
+                ),
+                DeviceModelShape::Empty => {
+                    DeviceModel::empty(limits.max_device_model_variables)
+                }
             },
             capabilities: Capabilities::default(),
             network_profiles: NetworkProfileStore::with_max_slots(limits.max_network_profile_slots),
@@ -3107,15 +3110,15 @@ mod tests {
         ChargePointEffect, EvseStatus, IdToken, IdTokenKind, TransactionUpdateReason,
     };
 
-    /// `StateLimits::default_variables = false` builds the device model without the spec-default
+    /// `DeviceModelShape::TopologyOnly` builds the device model without the spec-default
     /// catalog - the ~55-variable 2.x reporting surface a 1.6-only charge point can never serve.
     /// The topology variables still register, since the state machine writes availability through
     /// them whatever the negotiated version.
     #[test]
-    fn with_limits_without_default_variables_keeps_only_the_topology_model() {
+    fn with_limits_topology_only_keeps_only_the_topology_model() {
         let state = ChargePointState::with_limits(
             [1],
-            StateLimits::new().with_default_variables(false),
+            StateLimits::new().with_device_model_shape(DeviceModelShape::TopologyOnly),
         );
 
         assert!(
@@ -3127,6 +3130,26 @@ mod tests {
                     "ChargingStation" | "EVSE" | "Connector" | "ConnectorPlugRetentionLock"
                 ))
         );
+    }
+
+    /// `DeviceModelShape::Empty` registers nothing - availability writes then no-op through
+    /// `set_attribute_value`, which the connector-status path exercises on every transition.
+    #[test]
+    fn with_limits_empty_model_tolerates_availability_writes() {
+        let mut state = ChargePointState::with_limits(
+            [1],
+            StateLimits::new().with_device_model_shape(DeviceModelShape::Empty),
+        );
+
+        assert_eq!(state.device_model.len(), 0);
+        state.apply(ChargePointEvent::Evse {
+            evse_id: 0,
+            event: EvseEvent::Connector {
+                connector_id: 0,
+                event: crate::state::ConnectorEvent::CableConnected,
+            },
+        });
+        assert_eq!(state.device_model.len(), 0);
     }
 
     #[test]
