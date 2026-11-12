@@ -252,11 +252,14 @@ impl DeviceModel {
     ///
     /// `max_variables` still bounds later registrations (`capability_gate_events`, restores from
     /// persistence, CSMS-driven `VariableRegistered`s); it is *not* raised for anything, since
-    /// nothing is registered.
+    /// nothing is registered - and unlike the other constructors `0` is honoured verbatim: a
+    /// bound of zero refuses every later registration, which is how a deployment declares "this
+    /// charge point has no device model at all" (see [`DeviceModelShape::Empty`] and the
+    /// network-configuration sync, which skips a model that can hold nothing).
     pub fn empty(max_variables: usize) -> Self {
         Self {
             components: BTreeMap::new(),
-            max_variables: max_variables.max(1),
+            max_variables,
         }
     }
 
