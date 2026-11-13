@@ -964,6 +964,15 @@ impl<T, X: Executor> ChargePointBuilder<T, X> {
         let mut states = self.runtime.subscribe();
         self.executor.spawn(Box::pin(async move {
             let mut was_accepted = states.borrow().may_send_requests();
+            // The edge this watcher waits on may already have happened: `provisioning` accepts
+            // the BootNotification during its own builder step, so a resynchronisation
+            // registered later in the chain spawns with `may_send_requests` already true and
+            // would wait for a false -> true transition that never comes. B01.FR.05's sweep is
+            // owed regardless of when in the chain this block was installed.
+            if was_accepted {
+                crate::availability::report_all_connector_statuses(&accept_actor, &accept_csms)
+                    .await;
+            }
             loop {
                 states.changed().await;
                 let accepted = states.borrow().may_send_requests();
@@ -3637,6 +3646,42 @@ mod tests {
         // Exactly one StatusNotification per status change: the repeat `status_notifications`
         // registration must not have spawned a second forwarder.
         assert_eq!(calls.load(Ordering::SeqCst) - before, 1);
+    }
+
+    #[tokio::test]
+    async fn resynchronisation_reports_all_statuses_when_acceptance_precedes_install() {
+        // B01.FR.05 fires on the false -> true edge of `may_send_requests`. The watcher samples
+        // that flag when it spawns, so a registration accepted *before* this builder ran - the
+        // integrator called `provisioning` earlier in the chain, or the CSMS answered the
+        // BootNotification faster than the remaining blocks registered - leaves `was_accepted`
+        // already true and the edge is gone forever: no StatusNotification would ever reach the
+        // CSMS until the next reconnect.
+        let (charge_point, _locked) = test_charge_point(true);
+        let calls = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let csms = CountingStatusCsms {
+            calls: calls.clone(),
+        };
+
+        let builder = ChargePointBuilder::start(charge_point, TokioExecutor)
+            .await
+            .unwrap();
+        // Registration lands before the resynchronisation watcher exists.
+        accept_registration(&builder.runtime).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+
+        let _runtime = builder
+            .connector_status_resynchronisation(&csms, crate::clock::SystemMonotonicClock)
+            .await
+            .build();
+
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+
+        // One StatusNotification per connector; the test rig has exactly one.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     type BoxedReconnectCallback =
