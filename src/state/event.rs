@@ -1046,9 +1046,10 @@ pub struct ConnectorStatusChanged {
     /// The connector's new state at its full, protocol-version-independent granularity.
     /// Versions with a richer wire status than `status` (e.g. 1.6J's `Preparing`/`Charging`/
     /// `Finishing`/`SuspendedEV`/`SuspendedEVSE`) derive their own mapping from this instead -
-    /// see `docs/ROADMAP.md` §0. This effect still only fires when `status` itself changes (the
-    /// same cadence every version has always gotten); it does not yet fire on every internal
-    /// transition a richer version might also want reported.
+    /// see `docs/ROADMAP.md` §0. This effect fires on every internal `ConnectorState`
+    /// transition, not just ones that cross a `status` boundary; suppressing the redundant
+    /// ones is each `StatusNotifier`'s [`crate::availability::StatusNotifier::status_dedup_key`]
+    /// job, which richer versions key on what they would actually send.
     pub connector_state: ConnectorState,
 }
 

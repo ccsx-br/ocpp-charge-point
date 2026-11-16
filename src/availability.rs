@@ -43,21 +43,43 @@ pub trait StatusNotifier {
         status: ConnectorStatus,
         connector_state: ConnectorState,
     ) -> Result<(), Self::Error>;
+
+    /// The deduplication key [`DedupedStatusNotifier`] caches per connector: the value whose
+    /// change means the *wire-visible* status changed. Versions whose wire status is no richer
+    /// than [`ConnectorStatus`] get the default - dedup on the coarse status itself. An adapter
+    /// whose wire status is richer (1.6J's `Preparing`/`Charging`/`SuspendedEV`/`SuspendedEVSE`/
+    /// `Finishing`) overrides this to key on the status it would actually send, so an internal
+    /// transition that changes the wire-visible status (e.g. `Starting` -> `Charging`, both
+    /// `Occupied`) is forwarded rather than swallowed as a false duplicate - and one that does
+    /// not (e.g. `Connected` -> `Locked`, both 1.6J `Preparing`) is still suppressed.
+    ///
+    /// Keys only need to be consistent within one notifier implementation: each connector's
+    /// cache lives inside a single [`DedupedStatusNotifier`] wrapping a single adapter, so a
+    /// plain `u16` (typically an `as` cast of the wire-status enum) is enough.
+    fn status_dedup_key(&self, status: ConnectorStatus, connector_state: ConnectorState) -> u16 {
+        let _ = connector_state;
+        status as u16
+    }
 }
 
-/// Wraps any [`StatusNotifier`] to only forward a call when `status` actually differs from the
-/// last one reported for that connector (or is the first one ever reported for it) - restoring
-/// the "only report on a wire-visible status change" cadence for versions whose own status is no
-/// richer than [`ConnectorStatus`], now that [`crate::state::ChargePointState`] itself reports
-/// every internal `ConnectorState` transition, not just ones that cross a `ConnectorStatus`
-/// boundary (see `docs/ROADMAP.md` §0). `connector_state` is always forwarded unchanged
-/// regardless of the dedup decision - only whether `inner` is called at all is affected.
+/// Wraps any [`StatusNotifier`] to only forward a call when the connector's *wire-visible*
+/// status actually differs from the last one reported (or is the first one ever reported for
+/// it) - restoring the "only report on a wire-visible status change" cadence now that
+/// [`crate::state::ChargePointState`] itself reports every internal `ConnectorState`
+/// transition, not just ones that cross a `ConnectorStatus` boundary (see `docs/ROADMAP.md`
+/// §0). `connector_state` is always forwarded unchanged regardless of the dedup decision -
+/// only whether `inner` is called at all is affected.
+///
+/// "Wire-visible" is defined by `inner` itself, through
+/// [`StatusNotifier::status_dedup_key`]: the default dedups on the coarse `status`, which is
+/// right for versions whose own status is no richer than [`ConnectorStatus`]; a version with a
+/// richer wire status (e.g. [`crate::availability::Ocpp1_6StatusNotifier`]) overrides the key
+/// so a transition that changes what it would send is never suppressed, even when the coarse
+/// `status` repeats.
 ///
 /// [`crate::setup`] wraps its `csms` in this for status reporting specifically, so - unless an
 /// integrator bypasses `setup()` - existing deployments keep the wire cadence they had before
-/// `ChargePointState` started reporting every transition. A version with its own richer status
-/// (e.g. [`crate::availability::Ocpp1_6StatusNotifier`]) should **not** be wrapped in this - it
-/// needs every call, including ones where `status` repeats but `connector_state` doesn't.
+/// `ChargePointState` started reporting every transition.
 ///
 /// An entry is only recorded once `inner` has actually accepted the notification (returned
 /// `Ok`) - never merely attempted. This matters when this type is composed with an offline-queue
@@ -81,9 +103,10 @@ pub struct DedupedStatusNotifier<N> {
     last_sent: LastSentStatuses,
 }
 
-/// Per-connector last-reported [`ConnectorStatus`], keyed by `(evse_id, connector_id)`.
+/// Per-connector last-reported dedup key (see [`StatusNotifier::status_dedup_key`]), keyed by
+/// `(evse_id, connector_id)`.
 type LastSentStatuses =
-    BlockingMutex<CriticalSectionRawMutex, RefCell<BTreeMap<(usize, usize), ConnectorStatus>>>;
+    BlockingMutex<CriticalSectionRawMutex, RefCell<BTreeMap<(usize, usize), u16>>>;
 
 impl<N> DedupedStatusNotifier<N> {
     /// Wraps `inner`, starting with no cached status for any connector - so the first call for
@@ -107,9 +130,10 @@ impl<N: StatusNotifier + Sync> StatusNotifier for DedupedStatusNotifier<N> {
         status: ConnectorStatus,
         connector_state: ConnectorState,
     ) -> Result<(), Self::Error> {
+        let key = self.inner.status_dedup_key(status, connector_state);
         let is_duplicate = self
             .last_sent
-            .lock(|cache| cache.borrow().get(&(evse_id, connector_id)) == Some(&status));
+            .lock(|cache| cache.borrow().get(&(evse_id, connector_id)) == Some(&key));
         if is_duplicate {
             return Ok(());
         }
@@ -119,8 +143,12 @@ impl<N: StatusNotifier + Sync> StatusNotifier for DedupedStatusNotifier<N> {
         // Only recorded now that `inner` has actually accepted it - see this type's docs for why
         // a failed send must not reach this point.
         self.last_sent
-            .lock(|cache| cache.borrow_mut().insert((evse_id, connector_id), status));
+            .lock(|cache| cache.borrow_mut().insert((evse_id, connector_id), key));
         Ok(())
+    }
+
+    fn status_dedup_key(&self, status: ConnectorStatus, connector_state: ConnectorState) -> u16 {
+        self.inner.status_dedup_key(status, connector_state)
     }
 }
 
@@ -286,6 +314,10 @@ where
             .notify_status(evse_id, connector_id, status, connector_state)
             .await
     }
+
+    fn status_dedup_key(&self, status: ConnectorStatus, connector_state: ConnectorState) -> u16 {
+        self.inner.status_dedup_key(status, connector_state)
+    }
 }
 
 /// The scope of a CSMS-initiated `ChangeAvailability` request - OCPP's optional `evse`/
@@ -326,6 +358,14 @@ impl<N: StatusNotifier + Send + Sync> StatusNotifier for alloc::sync::Arc<N> {
         (**self)
             .notify_status(evse_id, connector_id, status, connector_state)
             .await
+    }
+
+    fn status_dedup_key(
+        &self,
+        status: crate::state::ConnectorStatus,
+        connector_state: crate::state::ConnectorState,
+    ) -> u16 {
+        (**self).status_dedup_key(status, connector_state)
     }
 }
 
@@ -1191,6 +1231,94 @@ mod deduped_status_notifier_tests {
         assert_eq!(seen.borrow().len(), 2);
     }
 
+    /// A `StatusNotifier` like [`super::ocpp_1_6::Ocpp1_6StatusNotifier`]'s: its wire status is
+    /// richer than `ConnectorStatus` (`SuspendedEV`/`Finishing`/...), so it overrides
+    /// [`StatusNotifier::status_dedup_key`] to dedup on what it would actually send rather than
+    /// on the coarse status every internal transition already carries.
+    struct RichStatusNotifier {
+        seen: watch::Sender<Vec<(usize, usize, ConnectorStatus, ConnectorState)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl StatusNotifier for RichStatusNotifier {
+        type Error = NotifyError;
+
+        fn status_dedup_key(
+            &self,
+            _status: ConnectorStatus,
+            connector_state: ConnectorState,
+        ) -> u16 {
+            // The shape of 1.6J's `map_status`: `Charging`/`SuspendedEv`/`SuspendedEvse`/`Finishing`
+            // are distinct on the wire, while `Connected`/`Locked`/`Starting` all collapse into
+            // the same "occupied, not charging" value (`Preparing`).
+            match connector_state {
+                ConnectorState::Charging => 10,
+                ConnectorState::SuspendedEv => 11,
+                ConnectorState::SuspendedEvse => 12,
+                ConnectorState::Stopping
+                | ConnectorState::StoppingLocked
+                | ConnectorState::Finishing
+                | ConnectorState::Unlocking => 13,
+                other => other.availability_status() as u16,
+            }
+        }
+
+        async fn notify_status(
+            &self,
+            evse_id: usize,
+            connector_id: usize,
+            status: ConnectorStatus,
+            connector_state: ConnectorState,
+        ) -> Result<(), Self::Error> {
+            self.seen
+                .send_modify(|seen| seen.push((evse_id, connector_id, status, connector_state)));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_different_dedup_key_forwards_even_when_the_coarse_status_repeats() {
+        let (seen_tx, seen_rx) = watch::channel(Vec::new());
+        let notifier = DedupedStatusNotifier::new(RichStatusNotifier { seen: seen_tx });
+
+        // `Starting` -> `Charging` keeps the coarse `Occupied` status but produces a different
+        // wire status for a richer version (1.6J's `Preparing` -> `Charging`) - suppressing it
+        // is the "CSMS never sees the charge begin" bug `status_dedup_key` exists to prevent.
+        notifier
+            .notify_status(0, 0, ConnectorStatus::Occupied, ConnectorState::Starting)
+            .await
+            .unwrap();
+        notifier
+            .notify_status(0, 0, ConnectorStatus::Occupied, ConnectorState::Charging)
+            .await
+            .unwrap();
+        notifier
+            .notify_status(0, 0, ConnectorStatus::Occupied, ConnectorState::SuspendedEv)
+            .await
+            .unwrap();
+
+        assert_eq!(seen_rx.borrow().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_same_dedup_key_is_still_suppressed_for_a_richer_version() {
+        let (seen_tx, seen_rx) = watch::channel(Vec::new());
+        let notifier = DedupedStatusNotifier::new(RichStatusNotifier { seen: seen_tx });
+
+        // `Connected` -> `Locked` maps to the same 1.6J wire status (`Preparing`), so even a
+        // richer version must not be re-notified - the key, not just the dedup, is what changed.
+        notifier
+            .notify_status(0, 0, ConnectorStatus::Occupied, ConnectorState::Connected)
+            .await
+            .unwrap();
+        notifier
+            .notify_status(0, 0, ConnectorStatus::Occupied, ConnectorState::Locked)
+            .await
+            .unwrap();
+
+        assert_eq!(seen_rx.borrow().len(), 1);
+    }
+
     #[tokio::test]
     async fn each_connector_is_deduped_independently() {
         let (notifier, seen) = notifier();
@@ -1944,10 +2072,10 @@ mod ocpp_2_0_1 {
 /// the `ConnectorStatus` this
 /// crate's `StatusNotifier` trait mostly targets (`Preparing`/`Charging`/`SuspendedEVSE`/
 /// `SuspendedEV`/`Finishing`, not just `Occupied`), so [`map_status`] derives it from the full
-/// `ConnectorState` instead. That richer status is only reported at the same cadence every other
-/// version already gets, though (whenever the coarse `ConnectorStatus` changes) - see
-/// `ConnectorStatusChanged::connector_state`'s docs for why finer-grained internal transitions
-/// (e.g. `Starting` -> `Charging`, both `Occupied`) don't yet re-fire this effect.
+/// `ConnectorState` instead - and [`StatusNotifier::status_dedup_key`] keys dedup on that same
+/// wire status, so every finer-grained internal transition (`Starting` -> `Charging`,
+/// `Charging` -> `SuspendedEv`, ...) that changes what the CSMS sees is reported, not just the
+/// ones that cross a coarse `ConnectorStatus` boundary.
 #[cfg(feature = "ocpp_1_6")]
 mod ocpp_1_6 {
     use crate::availability::StatusNotifier;
@@ -1970,6 +2098,13 @@ mod ocpp_1_6 {
     /// `SuspendedEV`/`SuspendedEVSE` are the two statuses this mapping could not produce before
     /// B1.5, because the connector state machine had no way to distinguish which side stopped the
     /// energy flow. It does now, and 1.6J is the version that can say so directly.
+    ///
+    /// [`Ocpp1_6StatusNotifier::status_dedup_key`] keys on this same value: dedup must follow
+    /// what `notify_status` would actually put on the wire, or a transition that changes the
+    /// wire status without changing the coarse `ConnectorStatus` (`Starting` -> `Charging`,
+    /// `Charging` -> `SuspendedEv`, `Finishing` -> `Connected`'s sibling `Unlocking`...) is
+    /// suppressed as a false duplicate - which is exactly how a 1.6J CSMS ends up still showing
+    /// `Preparing` mid-charge.
     pub(super) fn map_status(state: ConnectorState) -> StatusNotificationRequestStatus {
         match state {
             ConnectorState::Available => StatusNotificationRequestStatus::Available,
@@ -1993,6 +2128,14 @@ mod ocpp_1_6 {
             }
             ConnectorState::Reserved => StatusNotificationRequestStatus::Reserved,
         }
+    }
+
+    /// The value [`DedupedStatusNotifier`](crate::availability::DedupedStatusNotifier) compares
+    /// for this version: the 1.6J wire status itself, so a transition that changes it
+    /// (`Starting` -> `Charging`, `Charging` -> `SuspendedEv`) is forwarded while one that does
+    /// not (`Connected` -> `Locked`, both `Preparing`) is still suppressed.
+    pub(super) fn status_dedup_key(state: ConnectorState) -> u16 {
+        map_status(state) as u16
     }
 
     /// Wraps an `OCPP1_6Client` with the charge point's connector topology, needed to translate
@@ -2039,6 +2182,14 @@ mod ocpp_1_6 {
     #[async_trait::async_trait]
     impl StatusNotifier for Ocpp1_6StatusNotifier {
         type Error = ClientError<OCPP1_6Error>;
+
+        fn status_dedup_key(
+            &self,
+            _status: crate::state::ConnectorStatus,
+            connector_state: ConnectorState,
+        ) -> u16 {
+            status_dedup_key(connector_state)
+        }
 
         async fn notify_status(
             &self,
@@ -2137,6 +2288,33 @@ mod ocpp_1_6 {
             assert_eq!(
                 map_status(ConnectorState::Reserved),
                 StatusNotificationRequestStatus::Reserved
+            );
+        }
+
+        #[test]
+        fn the_dedup_key_follows_the_wire_status_not_the_coarse_one() {
+            // The transitions that were being swallowed as false `Occupied` duplicates - a CSMS
+            // stuck on `Preparing` for the whole session is this bug surfacing.
+            assert_ne!(
+                status_dedup_key(ConnectorState::Starting),
+                status_dedup_key(ConnectorState::Charging)
+            );
+            assert_ne!(
+                status_dedup_key(ConnectorState::Charging),
+                status_dedup_key(ConnectorState::SuspendedEv)
+            );
+            assert_ne!(
+                status_dedup_key(ConnectorState::Charging),
+                status_dedup_key(ConnectorState::Finishing)
+            );
+            // And the ones that must stay deduped, all `Preparing` on the wire.
+            assert_eq!(
+                status_dedup_key(ConnectorState::Connected),
+                status_dedup_key(ConnectorState::Locked)
+            );
+            assert_eq!(
+                status_dedup_key(ConnectorState::Locked),
+                status_dedup_key(ConnectorState::Starting)
             );
         }
 
