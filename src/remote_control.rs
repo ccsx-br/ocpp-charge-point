@@ -536,16 +536,19 @@ pub trait RequestStartTransactionHandler {
 pub enum RequestStopTransactionOutcome {
     /// The transaction was stopped.
     Accepted,
-    /// `transaction_id` was unknown, or its connector isn't currently `Charging`.
+    /// `transaction_id` was unknown, or its connector isn't charging (or suspended) - a
+    /// transaction that is merely suspended is still running, and `ChargingStopped` is a
+    /// valid transition out of `SuspendedEv`/`SuspendedEvse` exactly as out of `Charging`.
     Rejected,
 }
 
 /// Handles a CSMS-initiated `RequestStopTransaction` request against `actor`: finds the
-/// connector whose active transaction is `transaction_id` and, if it's currently `Charging`,
-/// stops it (`ConnectorEvent::ChargingStopped(StopReason::Remote)`) and accepts. Rejects an
-/// unknown `transaction_id`, or one that isn't currently `Charging` - the connector state
-/// machine's only stop path is `Charging` -> `Stopping`, so e.g. a transaction still `Starting`
-/// (contactor not yet confirmed closed) can't be stopped this way yet.
+/// connector whose active transaction is `transaction_id` and, if it's currently `Charging`
+/// (or `SuspendedEv`/`SuspendedEvse` - a suspension pauses the energy flow but leaves the
+/// transaction running, so it is just as stoppable), stops it
+/// (`ConnectorEvent::ChargingStopped(StopReason::Remote)`) and accepts. Rejects an unknown
+/// `transaction_id`, or one whose connector has no stop path left - e.g. a transaction still
+/// `Starting` (contactor not yet confirmed closed) can't be stopped this way yet.
 #[tracing::instrument(skip_all, fields(transaction_id = transaction_id.0))]
 pub async fn handle_request_stop_transaction(
     actor: &ChargePointActor,
@@ -563,10 +566,14 @@ pub async fn handle_request_stop_transaction(
         tracing::warn!("refusing RequestStopTransaction: no such transaction is running here");
         return RequestStopTransactionOutcome::Rejected;
     };
-    if state.evses[evse_id].connectors[connector_id] != ConnectorState::Charging {
+    let connector_state = state.evses[evse_id].connectors[connector_id];
+    if !matches!(
+        connector_state,
+        ConnectorState::Charging | ConnectorState::SuspendedEv | ConnectorState::SuspendedEvse
+    ) {
         tracing::warn!(
-            connector_state = ?state.evses[evse_id].connectors[connector_id],
-            "refusing RequestStopTransaction: the connector is not charging"
+            ?connector_state,
+            "refusing RequestStopTransaction: the transaction is not running"
         );
         return RequestStopTransactionOutcome::Rejected;
     }
@@ -793,7 +800,9 @@ mod tests {
     /// (B02.FR.05, CV4), so "accepted" is the state a remote-control test is actually about -
     /// spawning a bare actor would test the boot gate over and over instead. The one test that
     /// *is* about the gate builds its own actor.
-    async fn accepted_actor<const N: usize>(connector_counts: [usize; N]) -> ChargePointActor {
+    pub(super) async fn accepted_actor<const N: usize>(
+        connector_counts: [usize; N],
+    ) -> ChargePointActor {
         let actor = ChargePointActor::spawn(connector_counts, &TokioExecutor);
         actor
             .send(ChargePointEvent::RegistrationStatusReceived(
@@ -823,7 +832,7 @@ mod tests {
     use alloc::vec::Vec;
     use tokio::sync::watch;
 
-    fn test_id_token() -> crate::state::IdToken {
+    pub(super) fn test_id_token() -> crate::state::IdToken {
         crate::state::IdToken {
             value: "04A224B2".into(),
             kind: crate::state::IdTokenKind::ISO14443,
@@ -948,7 +957,11 @@ mod tests {
         );
     }
 
-    async fn lock_connector(actor: &ChargePointActor, evse_id: usize, connector_id: usize) {
+    pub(super) async fn lock_connector(
+        actor: &ChargePointActor,
+        evse_id: usize,
+        connector_id: usize,
+    ) {
         for event in [
             ConnectorEvent::CableConnected,
             ConnectorEvent::LockConfirmed,
@@ -1501,7 +1514,7 @@ mod tests {
     }
 
     /// Spawns an actor with connector 0 `Charging` on a fresh transaction.
-    async fn charging_actor() -> ChargePointActor {
+    pub(super) async fn charging_actor() -> ChargePointActor {
         let actor = accepted_actor([1]).await;
         lock_connector(&actor, 0, 0).await;
         handle_request_start_transaction(&actor, Some(0), test_id_token(), None, None).await;
@@ -1554,6 +1567,43 @@ mod tests {
             actor.state().evses[0].connectors[0],
             ConnectorState::Starting
         );
+    }
+
+    /// A suspended transaction is still running - suspension pauses the energy flow, not the
+    /// transaction - so a remote stop must end it exactly like a `Charging` one. The connector
+    /// state machine's `ChargingStopped` transition accepts `SuspendedEv`/`SuspendedEvse` just
+    /// as it accepts `Charging`.
+    #[tokio::test]
+    async fn a_suspended_transaction_accepts_a_remote_stop() {
+        for suspend in [
+            ConnectorEvent::ChargingSuspendedByEv,
+            ConnectorEvent::ChargingSuspendedByEvse,
+        ] {
+            let actor = charging_actor().await;
+            actor
+                .send(ChargePointEvent::Evse {
+                    evse_id: 0,
+                    event: EvseEvent::Connector {
+                        connector_id: 0,
+                        event: suspend,
+                    },
+                })
+                .await
+                .unwrap();
+            let suspended = actor.state().evses[0].connectors[0];
+
+            let outcome = handle_request_stop_transaction(&actor, TransactionId(0)).await;
+
+            assert_eq!(
+                outcome,
+                RequestStopTransactionOutcome::Accepted,
+                "{suspended:?} must not make a running transaction unstoppable"
+            );
+            assert_eq!(
+                actor.state().evses[0].connectors[0],
+                ConnectorState::Stopping
+            );
+        }
     }
 
     #[tokio::test]
@@ -2809,8 +2859,12 @@ pub(crate) mod ocpp_2_0_1 {
 /// that follows instead.
 ///
 /// `RemoteStopTransactionRequest.transactionId` is a bare `i64` (not 2.x's stringified `u64`)
-/// and needs no topology at all, so `RequestStopTransactionHandler` is implemented directly on
-/// `OCPP1_6Client` rather than through the wrapper.
+/// and needs no topology - but it *does* need the CSMS-id translation only
+/// [`crate::transactions::Ocpp1_6TransactionNotifier`] can supply (1.6J is the version where
+/// the CSMS, not the charge point, mints `transactionId`). `Ocpp1_6RemoteControlHandler`
+/// therefore registers its own handler resolving through
+/// [`Ocpp1_6RemoteControlHandler::with_csms_id_lookup`]; the impl on `OCPP1_6Client` remains
+/// for callers that wire no lookup.
 #[cfg(feature = "ocpp_1_6")]
 mod ocpp_1_6 {
     use super::{
@@ -2973,6 +3027,14 @@ mod ocpp_1_6 {
             self.status
                 .notify_status(evse_id, connector_id, status, connector_state)
                 .await
+        }
+
+        fn status_dedup_key(
+            &self,
+            status: crate::state::ConnectorStatus,
+            connector_state: crate::state::ConnectorState,
+        ) -> u16 {
+            self.status.status_dedup_key(status, connector_state)
         }
     }
 
@@ -3243,9 +3305,17 @@ mod ocpp_1_6 {
     /// Wraps an `OCPP1_6Client` with the charge point's connector topology, needed to translate
     /// `UnlockConnectorRequest`'s/`RemoteStartTransactionRequest`'s flat `connectorId` into this
     /// crate's `(evse_id, connector_id)` addressing - see this module's docs.
+    ///
+    /// `RemoteStopTransaction` additionally wants the CSMS-assigned transaction id cache an
+    /// [`crate::transactions::Ocpp1_6TransactionNotifier`] maintains - 1.6J alone lets the
+    /// CSMS mint `transactionId`, so the wire id and the internal [`TransactionId`] live in
+    /// different namespaces and the one cannot be found by the other. Wire it with
+    /// [`Self::with_csms_id_lookup`]; without it, remote stops keep the historical (broken for
+    /// 1.6J) behaviour of comparing the wire id against internal ids.
     pub struct Ocpp1_6RemoteControlHandler {
         client: OCPP1_6Client,
         connector_counts: Vec<usize>,
+        csms_id_lookup: Option<crate::transactions::CsmsTransactionIdLookup>,
     }
 
     impl Ocpp1_6RemoteControlHandler {
@@ -3258,6 +3328,44 @@ mod ocpp_1_6 {
             Self {
                 client,
                 connector_counts: connector_counts.into_iter().collect(),
+                csms_id_lookup: None,
+            }
+        }
+
+        /// Gives the handler the CSMS-transaction-id cache the matching
+        /// [`crate::transactions::Ocpp1_6TransactionNotifier`] maintains - see the type's docs
+        /// for why `RemoteStopTransaction` cannot resolve its `transactionId` without it. The
+        /// clone shares the notifier's map, so ids cached after this call still resolve.
+        pub fn with_csms_id_lookup(
+            mut self,
+            lookup: crate::transactions::CsmsTransactionIdLookup,
+        ) -> Self {
+            self.csms_id_lookup = Some(lookup);
+            self
+        }
+    }
+
+    /// Handles a 1.6J `RemoteStopTransaction`: `transaction_id` on the wire is CSMS-assigned, so
+    /// it resolves through `csms_id_lookup` to the internal [`TransactionId`] before dispatching
+    /// the shared stop path. An unresolvable id is rejected without touching the actor - it
+    /// names no transaction this charge point ever started.
+    async fn handle_remote_stop(
+        actor: &ChargePointActor,
+        guard: &ReplayGuard<TransactionId>,
+        csms_id_lookup: &crate::transactions::CsmsTransactionIdLookup,
+        transaction_id: i64,
+    ) -> RequestStopTransactionOutcome {
+        match csms_id_lookup.resolve(transaction_id) {
+            Some(transaction_id) => {
+                handle_request_stop_transaction_with_replay_guard(actor, guard, transaction_id)
+                    .await
+            }
+            None => {
+                tracing::warn!(
+                    transaction_id,
+                    "refusing RemoteStopTransaction: unknown CSMS transaction id"
+                );
+                RequestStopTransactionOutcome::Rejected
             }
         }
     }
@@ -3326,19 +3434,47 @@ mod ocpp_1_6 {
         }
     }
 
-    /// Delegates to the wrapped client. `RemoteStopTransaction` addresses a transaction id, not a
-    /// connector, so 1.6J needs no topology for it - but
+    /// Registers `RemoteStopTransaction` resolving the wire's CSMS-assigned `transactionId`
+    /// through the lookup [`Self::with_csms_id_lookup`] supplies. `RemoteStopTransaction`
+    /// addresses a transaction id, not a connector, so 1.6J needs no topology for it - but
     /// [`ChargePointBuilder::remote_control`](crate::builder::ChargePointBuilder::remote_control)
     /// registers the three remote-control handlers together, so the wrapper implements this one
     /// too rather than making a 1.6J caller pass two different types for one functional block.
+    ///
+    /// Without a lookup (constructed with [`Self::new`] alone) the registration delegates to the
+    /// wrapped client's, which compares the wire id against internal ids - correct only by
+    /// coincidence on 1.6J, kept for callers that genuinely mint their own ids on the CSMS side.
     #[async_trait::async_trait]
     impl RequestStopTransactionHandler for Ocpp1_6RemoteControlHandler {
         async fn register_request_stop_transaction_handler(&self, actor: ChargePointActor) {
-            RequestStopTransactionHandler::register_request_stop_transaction_handler(
-                &self.client,
-                actor,
-            )
-            .await;
+            let Some(csms_id_lookup) = self.csms_id_lookup.clone() else {
+                RequestStopTransactionHandler::register_request_stop_transaction_handler(
+                    &self.client,
+                    actor,
+                )
+                .await;
+                return;
+            };
+            let guard = Arc::new(ReplayGuard::new());
+            self.client
+                .on_remote_stop_transaction(move |request, _client| {
+                    let actor = actor.clone();
+                    let guard = guard.clone();
+                    let csms_id_lookup = csms_id_lookup.clone();
+                    async move {
+                        let outcome = handle_remote_stop(
+                            &actor,
+                            &guard,
+                            &csms_id_lookup,
+                            request.transaction_id,
+                        )
+                        .await;
+                        Ok(RemoteStopTransactionResponse {
+                            status: map_stop_outcome(outcome),
+                        })
+                    }
+                })
+                .await;
         }
     }
 
@@ -3452,12 +3588,80 @@ mod ocpp_1_6 {
             assert_eq!(parse_evse_id(&connector_counts, &request(Some(5))), Err(()));
         }
 
+        /// A `CsmsTransactionIdLookup` over a standalone map pre-seeded with `ids`
+        /// (internal id -> CSMS-assigned wire id), so `handle_remote_stop` can be exercised
+        /// without a live `OCPP1_6Client`.
+        fn csms_lookup(ids: &[(u64, i64)]) -> crate::transactions::CsmsTransactionIdLookup {
+            use alloc::collections::BTreeMap;
+            use core::cell::RefCell;
+            use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
+            use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+
+            let map = Arc::new(BlockingMutex::<
+                CriticalSectionRawMutex,
+                RefCell<BTreeMap<TransactionId, i64>>,
+            >::new(RefCell::new(BTreeMap::new())));
+            map.lock(|cache| {
+                let mut cache = cache.borrow_mut();
+                for (internal, csms) in ids {
+                    cache.insert(TransactionId(*internal), *csms);
+                }
+            });
+            crate::transactions::CsmsTransactionIdLookup::new(map)
+        }
+
+        /// A `RemoteStopTransaction` quoting the CSMS's own `transactionId` must stop the
+        /// transaction that id was assigned to - the case that used to be rejected outright,
+        /// because the wire id was compared against internal ids instead of resolved.
+        #[tokio::test]
+        async fn a_csms_assigned_transaction_id_resolves_to_the_running_transaction() {
+            let actor = super::super::tests::charging_actor().await;
+            let lookup = csms_lookup(&[(0, 4242)]);
+
+            let outcome = handle_remote_stop(&actor, &ReplayGuard::new(), &lookup, 4242).await;
+
+            assert_eq!(outcome, RequestStopTransactionOutcome::Accepted);
+            assert_eq!(
+                actor.state().evses[0].connectors[0],
+                crate::state::ConnectorState::Stopping
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unresolved_csms_transaction_id_is_rejected() {
+            let actor = super::super::tests::charging_actor().await;
+            let lookup = csms_lookup(&[(0, 4242)]);
+
+            assert_eq!(
+                handle_remote_stop(&actor, &ReplayGuard::new(), &lookup, 9999).await,
+                RequestStopTransactionOutcome::Rejected
+            );
+            assert_eq!(
+                actor.state().evses[0].connectors[0],
+                crate::state::ConnectorState::Charging
+            );
+        }
+
+        /// The internal `TransactionId` is not a valid `transactionId` on a 1.6J wire - the
+        /// old code path compared them directly, which would have *accepted* this request.
+        #[tokio::test]
+        async fn the_internal_id_itself_is_not_valid_on_the_wire() {
+            let actor = super::super::tests::charging_actor().await;
+            let lookup = csms_lookup(&[(0, 4242)]);
+
+            assert_eq!(
+                handle_remote_stop(&actor, &ReplayGuard::new(), &lookup, 0).await,
+                RequestStopTransactionOutcome::Rejected
+            );
+        }
+
         #[test]
         fn ocpp1_6_remote_control_handler_implements_the_handler_traits() {
             fn assert_impl<T: UnlockConnectorHandler + RequestStartTransactionHandler>() {}
             assert_impl::<Ocpp1_6RemoteControlHandler>();
             fn assert_stop_impl<T: RequestStopTransactionHandler>() {}
             assert_stop_impl::<OCPP1_6Client>();
+            assert_stop_impl::<Ocpp1_6RemoteControlHandler>();
         }
     }
 }

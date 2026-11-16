@@ -6,7 +6,7 @@ use crate::sync::BroadcastReceiver;
 use alloc::boxed::Box;
 
 #[cfg(feature = "ocpp_1_6")]
-pub use self::ocpp_1_6::Ocpp1_6TransactionNotifier;
+pub use self::ocpp_1_6::{CsmsTransactionIdLookup, Ocpp1_6TransactionNotifier};
 #[cfg(feature = "ocpp_2_0_1")]
 pub use self::ocpp_2_0_1::Ocpp2_0_1TransactionNotifier;
 #[cfg(feature = "ocpp_2_1")]
@@ -2807,6 +2807,51 @@ pub(crate) mod ocpp_1_6 {
         }
     }
 
+    /// The shared map an [`Ocpp1_6TransactionNotifier`] caches CSMS-assigned transaction ids
+    /// in: internal [`TransactionId`] -> the `transactionId` `StartTransaction.conf` returned.
+    type SharedCsmsIds = alloc::sync::Arc<
+        BlockingMutex<CriticalSectionRawMutex, RefCell<BTreeMap<TransactionId, i64>>>,
+    >;
+
+    /// Shared read access to the CSMS-assigned transaction ids an
+    /// [`Ocpp1_6TransactionNotifier`] caches - the translation `RemoteStopTransaction` needs.
+    ///
+    /// 1.6J alone among the supported versions lets the *CSMS* mint `transactionId` (returned
+    /// in `StartTransaction.conf`), while this crate's transaction state - and
+    /// [`crate::remote_control::handle_request_stop_transaction`] - is keyed by the charge
+    /// point's own internal [`TransactionId`]. A `RemoteStopTransaction` therefore cannot be
+    /// handled without resolving the wire id back through this map; the other versions echo
+    /// the charge point's own id and need no lookup at all.
+    ///
+    /// Obtained via [`Ocpp1_6TransactionNotifier::csms_id_lookup`]. A clone shares the same
+    /// map, so ids cached after the clone is taken still resolve.
+    #[derive(Clone)]
+    pub struct CsmsTransactionIdLookup {
+        ids: SharedCsmsIds,
+    }
+
+    impl CsmsTransactionIdLookup {
+        /// Wraps a shared id map. [`Ocpp1_6TransactionNotifier::csms_id_lookup`] is the public
+        /// way to obtain one; `pub(crate)` so sibling modules (and their tests) can build a
+        /// lookup over a standalone map.
+        pub(crate) fn new(ids: SharedCsmsIds) -> Self {
+            Self { ids }
+        }
+
+        /// The internal [`TransactionId`] `csms_id` was assigned to, or `None` when no
+        /// `StartTransaction` this charge point ran produced it. A resumed session re-seeds
+        /// the cache from durable storage before continuing (see
+        /// [`Ocpp1_6TransactionNotifier::with_id_store`]), so those ids resolve too.
+        pub fn resolve(&self, csms_id: i64) -> Option<TransactionId> {
+            self.ids.lock(|cache| {
+                cache
+                    .borrow()
+                    .iter()
+                    .find_map(|(internal, csms)| (*csms == csms_id).then_some(*internal))
+            })
+        }
+    }
+
     /// Wraps an `OCPP1_6Client` with the charge point's connector topology, a cache of
     /// CSMS-assigned transaction ids, and a caller-supplied [`crate::clock::Clock`] for the
     /// `StartTransaction`/`MeterValues`/`StopTransaction` timestamp - see this module's top-level
@@ -2820,10 +2865,20 @@ pub(crate) mod ocpp_1_6 {
     pub struct Ocpp1_6TransactionNotifier<C, S = crate::hardware::NoStorage> {
         client: OCPP1_6Client,
         connector_counts: Vec<usize>,
-        csms_transaction_ids:
-            BlockingMutex<CriticalSectionRawMutex, RefCell<BTreeMap<TransactionId, i64>>>,
+        csms_transaction_ids: SharedCsmsIds,
         clock: C,
         id_store: S,
+    }
+
+    impl<C, S> Ocpp1_6TransactionNotifier<C, S> {
+        /// A cheap-to-clone handle resolving a CSMS-assigned `transactionId` back to the
+        /// internal [`TransactionId`] - `RemoteStopTransaction` needs this translation, since
+        /// 1.6J's wire id is minted by the CSMS rather than the charge point (see
+        /// [`CsmsTransactionIdLookup`]). The clone shares this notifier's cache, so ids stored
+        /// after the clone is taken still resolve.
+        pub fn csms_id_lookup(&self) -> CsmsTransactionIdLookup {
+            CsmsTransactionIdLookup::new(self.csms_transaction_ids.clone())
+        }
     }
 
     /// The storage-key prefix the persisted CSMS-assigned transaction ids live under - a sibling
@@ -2848,7 +2903,9 @@ pub(crate) mod ocpp_1_6 {
             Self {
                 client,
                 connector_counts: connector_counts.into_iter().collect(),
-                csms_transaction_ids: BlockingMutex::new(RefCell::new(BTreeMap::new())),
+                csms_transaction_ids: alloc::sync::Arc::new(BlockingMutex::new(RefCell::new(
+                    BTreeMap::new(),
+                ))),
                 clock,
                 id_store: crate::hardware::NoStorage,
             }

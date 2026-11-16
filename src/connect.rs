@@ -531,8 +531,12 @@ where
         client.clone(),
         counts.clone(),
     ));
+    // 1.6J's `RemoteStopTransaction` carries a CSMS-assigned `transactionId` - the lookup the
+    // transaction notifier owns is what resolves it back to the internal id (see
+    // `Ocpp1_6RemoteControlHandler::with_csms_id_lookup`).
     let remote =
-        crate::remote_control::Ocpp1_6RemoteControlHandler::new(client.clone(), counts.clone());
+        crate::remote_control::Ocpp1_6RemoteControlHandler::new(client.clone(), counts.clone())
+            .with_csms_id_lookup(transactions.csms_id_lookup());
     let trigger =
         crate::remote_control::Ocpp1_6TriggerMessageHandler::new(client.clone(), counts.clone());
     let availability =
