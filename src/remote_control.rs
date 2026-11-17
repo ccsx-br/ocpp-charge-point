@@ -445,7 +445,13 @@ fn find_start_target(
                 continue;
             }
             match evse.connectors[connector_id] {
-                ConnectorState::Locked => return Some((evse_id, connector_id, true)),
+                // Latched, so the request acts now (F01): `Locked` is the canonical case, but
+                // the cable is just as present on `Connected` (lock confirmation still in
+                // flight, or a lockless board) and on `Finishing` (session over, cable still
+                // in - the post-transaction rest state).
+                ConnectorState::Locked | ConnectorState::Connected | ConnectorState::Finishing => {
+                    return Some((evse_id, connector_id, true))
+                }
                 // Reached only when the reservation admits this driver - `can_start_here` has
                 // already refused every other one.
                 ConnectorState::Reserved if reserved_waiting.is_none() => {
@@ -480,7 +486,15 @@ fn can_start_here(
         // say nothing unless a matching identifier can get as far as the comparison below.
         // Excluding the state outright would refuse a remote start from the very driver the bay is
         // being held for - which is the one thing a reservation exists to enable.
-        ConnectorState::Available | ConnectorState::Locked | ConnectorState::Reserved => {}
+        //
+        // `Connected` and `Finishing` are cable-occupied too: the cable is in, so F01's "start
+        // now" applies - `Connected` covers a lock confirmation still in flight (or a board
+        // with no lock actuator), `Finishing` the post-session rest state the cable never left.
+        ConnectorState::Available
+        | ConnectorState::Locked
+        | ConnectorState::Connected
+        | ConnectorState::Finishing
+        | ConnectorState::Reserved => {}
         // FR.23 and everything else mid-session: not a connector a new request can be matched to.
         _ => return false,
     }
@@ -997,6 +1011,115 @@ mod tests {
             actor.state().evses[0].connectors[0],
             ConnectorState::Starting
         );
+    }
+
+    /// F01's premise is "the cable is already in" - which `Connected` also satisfies: the lock
+    /// confirmation may not have landed yet, or the board may have no lock actuator at all.
+    /// The start is immediate either way.
+    #[tokio::test]
+    async fn starting_a_transaction_on_a_connected_connector_succeeds() {
+        let actor = accepted_actor([1]).await;
+        actor
+            .send(ChargePointEvent::Evse {
+                evse_id: 0,
+                event: EvseEvent::Connector {
+                    connector_id: 0,
+                    event: ConnectorEvent::CableConnected,
+                },
+            })
+            .await
+            .unwrap();
+
+        let outcome =
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), None, None).await;
+
+        assert_eq!(
+            outcome,
+            RequestStartTransactionOutcome::Accepted {
+                transaction_id: TransactionId(0)
+            }
+        );
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Starting
+        );
+    }
+
+    /// A connector resting in `Finishing` - session over, cable still in - is the same
+    /// occupied bay as far as F01 is concerned, so a remote start takes it straight into a new
+    /// transaction rather than rejecting as it used to.
+    #[tokio::test]
+    async fn starting_a_transaction_on_a_finishing_connector_succeeds() {
+        let actor = actor_with_unlock_confirmed().await;
+        // Drive a full session to its post-stop rest state.
+        for event in [
+            ConnectorEvent::CableConnected,
+            ConnectorEvent::LockConfirmed,
+            ConnectorEvent::RemoteStartRequested {
+                id_token: test_id_token(),
+                remote_start_id: None,
+            },
+            ConnectorEvent::ContactorClosed,
+            ConnectorEvent::ChargingStopped(crate::state::StopReason::Remote),
+            ConnectorEvent::ContactorOpened,
+            ConnectorEvent::UnlockConfirmed,
+        ] {
+            actor
+                .send(ChargePointEvent::Evse {
+                    evse_id: 0,
+                    event: EvseEvent::Connector {
+                        connector_id: 0,
+                        event,
+                    },
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Finishing
+        );
+
+        let outcome =
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), None, None).await;
+
+        assert_eq!(
+            outcome,
+            RequestStartTransactionOutcome::Accepted {
+                transaction_id: TransactionId(1)
+            }
+        );
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Starting
+        );
+    }
+
+    /// The cable being in is not enough on its own: a connector already running a transaction
+    /// is F01.FR.24's refusal, whichever cable-occupied state it sits in.
+    #[tokio::test]
+    async fn a_remote_start_on_a_charging_connector_is_rejected() {
+        let actor = locked_actor().await;
+        handle_request_start_transaction(&actor, Some(0), test_id_token(), None, None).await;
+        actor
+            .send(ChargePointEvent::Evse {
+                evse_id: 0,
+                event: EvseEvent::Connector {
+                    connector_id: 0,
+                    event: ConnectorEvent::ContactorClosed,
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            actor.state().evses[0].connectors[0],
+            ConnectorState::Charging
+        );
+
+        let outcome =
+            handle_request_start_transaction(&actor, Some(0), test_id_token(), None, None).await;
+
+        assert_eq!(outcome, RequestStartTransactionOutcome::Rejected);
     }
 
     #[tokio::test]

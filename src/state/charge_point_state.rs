@@ -2446,10 +2446,13 @@ impl ChargePointState {
 
     /// Whether `pending`'s target has settled enough to reboot: for `Immediate`, every
     /// connector in scope has moved past the fail-safe stop this crate itself drove it through
-    /// (no longer `Stopping`/`Finishing`); for `OnIdle`, no connector in scope has a transaction
-    /// in progress. Either way, this can already be true the instant the request comes in (an
-    /// already-idle `OnIdle` target, or an `Immediate` target with nothing to interrupt) - the
-    /// reboot then fires immediately, without waiting on any hardware confirmation.
+    /// (no longer `Stopping` - `Finishing` is where that stop *settles*, with the contactor
+    /// confirmed open and the unlock already dispatched, and the serialized hardware-command
+    /// channel still runs the unlock before the reboot); for `OnIdle`, no connector in scope
+    /// has a transaction in progress. Either way, this can already be true the instant the
+    /// request comes in (an already-idle `OnIdle` target, or an `Immediate` target with
+    /// nothing to interrupt) - the reboot then fires immediately, without waiting on any
+    /// hardware confirmation.
     fn pending_reset_ready(&self, pending: &PendingReset) -> bool {
         match pending.kind {
             ResetKind::Immediate => !self
@@ -2458,7 +2461,7 @@ impl ChargePointState {
                 .any(|(evse_id, connector_id)| {
                     matches!(
                         self.evses[evse_id].connectors[connector_id],
-                        ConnectorState::Stopping | ConnectorState::Finishing
+                        ConnectorState::Stopping
                     )
                 }),
             ResetKind::OnIdle => !self
@@ -2874,16 +2877,33 @@ fn starts_transaction(
 ) -> bool {
     match tx_start_point {
         // The cable is in and latched. Everything after this - including an authorization that
-        // is refused - happens inside a transaction the CSMS already knows about.
+        // is refused - happens inside a transaction the CSMS already knows about. The second
+        // arm is the same condition seen later: a session that *begins* with the cable already
+        // in (a remote start on `Connected`/`Finishing`, or an authorization accepted on a
+        // connector that skipped `Locked` via the direct `Connected -> Authorizing` path)
+        // still covers the bay's occupation - `slot.is_none()` keeps the double-start out.
         TxStartPoint::EVConnected => {
-            previous_state == ConnectorState::Connected && new_state == ConnectorState::Locked
+            (previous_state == ConnectorState::Connected && new_state == ConnectorState::Locked)
+                || (matches!(
+                    previous_state,
+                    ConnectorState::Connected
+                        | ConnectorState::Locked
+                        | ConnectorState::Authorizing
+                        | ConnectorState::Finishing
+                ) && new_state == ConnectorState::Starting)
         }
         // OCPP's default: an identifier was accepted. Reached from `Authorizing` (a card was
-        // presented) or straight from `Locked` (a CSMS `RequestStartTransaction`).
+        // presented) or straight from `Locked`/`Connected`/`Finishing` (a CSMS
+        // `RequestStartTransaction` - under this point the request itself is the
+        // authorization decision, so it must produce a transaction from every cable-in
+        // state the request can act on).
         TxStartPoint::Authorized => {
             matches!(
                 previous_state,
-                ConnectorState::Authorizing | ConnectorState::Locked
+                ConnectorState::Authorizing
+                    | ConnectorState::Locked
+                    | ConnectorState::Connected
+                    | ConnectorState::Finishing
             ) && new_state == ConnectorState::Starting
         }
         // The contactor closed, so energy can flow.
@@ -2906,7 +2926,8 @@ fn starts_transaction(
 /// - **`PowerPathClosed`** - the contactor confirmed open. Both stopping states settle here, and
 ///   this is what this crate did unconditionally before `TxStopPoint` was honoured.
 /// - **`EVConnected`** - the cable left the connector, which is the connector returning to
-///   `Available` from `Connected`. The transaction therefore survives the whole unlock, which is
+///   `Available` from `Connected` or `Finishing` (the post-session rest state with the cable
+///   still in). The transaction therefore survives the whole unlock, which is
 ///   the point: it is billing for the bay being occupied.
 fn ends_transaction(
     previous_state: ConnectorState,
@@ -2932,7 +2953,10 @@ fn ends_transaction(
                     && new_state == ConnectorState::Locked)
         }
         TxStopPoint::EVConnected => {
-            previous_state == ConnectorState::Connected && new_state == ConnectorState::Available
+            matches!(
+                previous_state,
+                ConnectorState::Connected | ConnectorState::Finishing
+            ) && new_state == ConnectorState::Available
         }
     }
 }
@@ -3719,6 +3743,84 @@ mod tests {
         )));
     }
 
+    /// The cable is in but the lock confirmation has not landed yet - or, on a lockless board,
+    /// never will. F01 says the start is immediate whenever the cable is latched, and the
+    /// request itself is the authorization decision under `TxStartPoint::Authorized`, so the
+    /// transaction must be created here - not on a `Locked` step that was skipped.
+    #[test]
+    fn a_remote_start_request_while_connected_starts_a_transaction() {
+        let mut state = ChargePointState::new([1]);
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+
+        let effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::RemoteStartRequested {
+                id_token: test_id_token(),
+                remote_start_id: Some(11),
+            },
+        );
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Starting);
+        assert!(effects.contains(&ChargePointEffect::HardwareCommand(
+            HardwareCommand::CloseContactor {
+                evse_id: 0,
+                connector_id: 0,
+            }
+        )));
+        let transaction = state.evses[0].transactions[0]
+            .as_ref()
+            .expect("the request is the authorization; the transaction must exist");
+        assert_eq!(transaction.remote_start_id, Some(11));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            ChargePointEffect::TransactionEvent(occurred)
+                if occurred.kind == TransactionEventKind::Started
+        )));
+    }
+
+    /// A connector resting in `Finishing` - session over, cable still in - takes a remote start
+    /// exactly as `Locked` does, and it must produce a *new* transaction: under the default
+    /// `PowerPathClosed` stop point the previous one already ended on the way here.
+    #[test]
+    fn a_remote_start_request_while_finishing_starts_a_new_transaction() {
+        let mut state = ChargePointState::new([1]);
+        charging_connector(&mut state);
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingStopped(StopReason::Remote),
+        );
+        apply_connector_event(&mut state, ConnectorEvent::ContactorOpened);
+        apply_connector_event(&mut state, ConnectorEvent::UnlockConfirmed);
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Finishing);
+        assert!(transaction(&state).is_none());
+
+        let effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::RemoteStartRequested {
+                id_token: test_id_token(),
+                remote_start_id: Some(42),
+            },
+        );
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Starting);
+        assert!(effects.contains(&ChargePointEffect::HardwareCommand(
+            HardwareCommand::CloseContactor {
+                evse_id: 0,
+                connector_id: 0,
+            }
+        )));
+        let transaction = state.evses[0].transactions[0]
+            .as_ref()
+            .expect("a remote start on the settled post-session connector begins a transaction");
+        assert_eq!(transaction.id, TransactionId(1));
+        assert_eq!(transaction.remote_start_id, Some(42));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            ChargePointEffect::TransactionEvent(occurred)
+                if occurred.kind == TransactionEventKind::Started
+        )));
+    }
+
     /// **F01.FR.01** (CV7): with `AuthCtrlr.AuthorizeRemoteStart` on, a `RequestStartTransaction`
     /// is authorized exactly as a card presented at the reader would be - the CSMS's own request
     /// is no longer taken as the decision. Energy transfer waits for that decision, so nothing is
@@ -3886,8 +3988,11 @@ mod tests {
         }
     }
 
+    /// A remote start is an F01 action - "the cable is already in" - so it only has meaning on
+    /// a connector the cable occupies (`Connected`/`Locked`/`Finishing`). On an idle one it is
+    /// ignored; the held form (`RemoteStartPending`, F02) is what a no-cable request uses.
     #[test]
-    fn a_remote_start_request_is_ignored_outside_the_locked_state() {
+    fn a_remote_start_request_is_ignored_with_no_cable() {
         let mut state = ChargePointState::new([1]);
 
         let effects = apply_connector_event(
@@ -4871,7 +4976,7 @@ mod tests {
         );
         apply_connector_event(&mut state, ConnectorEvent::ContactorOpened);
         apply_connector_event(&mut state, ConnectorEvent::UnlockConfirmed);
-        assert_eq!(state.evses[0].connectors[0], ConnectorState::Connected);
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Finishing);
         assert!(
             transaction(&state).is_some(),
             "an unlocked but still-plugged connector is still occupied"

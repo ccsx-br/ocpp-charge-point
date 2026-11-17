@@ -272,6 +272,10 @@ mod tests {
             })
             .await
             .unwrap();
+        // `Finishing` is where the fail-safe stop *settles* - the contactor is confirmed open
+        // and the unlock is already dispatched, which is all an Immediate reset was ever
+        // waiting on. The command channel serializes, so the physical unlock still completes
+        // before the reboot runs.
         assert_eq!(
             commands.recv().await.unwrap(),
             HardwareCommand::UnlockConnector {
@@ -279,8 +283,14 @@ mod tests {
                 connector_id: 0
             }
         );
-        assert!(actor.state().pending_reset.is_some(), "still Finishing");
+        assert_eq!(
+            commands.recv().await.unwrap(),
+            HardwareCommand::Reboot { evse_id: 0 }
+        );
+        assert!(actor.state().pending_reset.is_none());
 
+        // The unlock confirmation arriving afterwards changes nothing: `Finishing` holds until
+        // the cable leaves.
         actor
             .send(ChargePointEvent::Evse {
                 evse_id: 0,
@@ -294,12 +304,7 @@ mod tests {
 
         assert_eq!(
             actor.state().evses[0].connectors[0],
-            ConnectorState::Connected
-        );
-        assert!(actor.state().pending_reset.is_none());
-        assert_eq!(
-            commands.recv().await.unwrap(),
-            HardwareCommand::Reboot { evse_id: 0 }
+            ConnectorState::Finishing
         );
         assert!(actor.state().evses[0].transactions[0].is_none());
     }

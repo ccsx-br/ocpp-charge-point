@@ -42,8 +42,12 @@ pub enum ConnectorState {
     /// by the time the contactor confirms open, the event that caused the stop is long gone, so
     /// the decision has to be carried in the state itself.
     StoppingLocked,
-    /// The contactor is open and the connector has been unlocked; the cable may still be
-    /// plugged in.
+    /// The transaction ended and the contactor is open; the cable may still be plugged in.
+    /// This is the connector's post-session rest state while the bay stays occupied - it
+    /// exits only when the cable leaves (`CableDisconnected` → `Available`), which is what
+    /// 1.6J's `Finishing` wire status means and what an operator billing for bay occupancy
+    /// needs to see. A new session can begin right from here: the cable is already in, so
+    /// a remote start or a re-presented identifier behaves exactly as it does on `Locked`.
     Finishing,
     /// Made unavailable (OCPP `ChangeAvailability`); not usable until made available again.
     Unavailable,
@@ -324,7 +328,14 @@ impl ConnectorState {
             // what the CSMS is told afterwards - see `ReservationEndReason`.
             (Self::Reserved, ConnectorEvent::ReservationExpired) => (Self::Available, None),
             (Self::Connected, ConnectorEvent::LockConfirmed) => (Self::Locked, None),
-            (Self::Locked, ConnectorEvent::IdTokenPresented(_)) => (Self::Authorizing, None),
+            // A presentation landing before `LockConfirmed` - the hardware reported the cable
+            // and the token in the same batch - must not be dropped: `Connected` is as much a
+            // cable-in rest state as `Locked` is, and on a lockless board it is the *only*
+            // latched state there is.
+            (
+                Self::Connected | Self::Locked,
+                ConnectorEvent::IdTokenPresented(_),
+            ) => (Self::Authorizing, None),
             // Plug & Charge takes the identical path: the certificate changes who can answer the
             // authorization question, not what the connector is waiting for while they do.
             (Self::Locked, ConnectorEvent::ContractCertificatePresented { .. }) => {
@@ -348,6 +359,21 @@ impl ConnectorState {
             (Self::Locked, ConnectorEvent::RemoteStartRequested { .. }) => {
                 (Self::Starting, Some(ConnectorCommand::CloseContactor))
             }
+            // F01 is "the cable is already in" - which `Connected` (lock confirmation still in
+            // flight, or a lockless board) and `Finishing` (session over, cable still in)
+            // satisfy exactly as `Locked` does. Same two-arm split: authorize first when
+            // F01.FR.01 says so.
+            (
+                Self::Connected | Self::Finishing,
+                ConnectorEvent::RemoteStartRequested { ref id_token, .. },
+            ) if policy.authorize_remote_start && id_token.kind.requires_authorization() =>
+            {
+                (Self::Authorizing, None)
+            }
+            (
+                Self::Connected | Self::Finishing,
+                ConnectorEvent::RemoteStartRequested { .. },
+            ) => (Self::Starting, Some(ConnectorCommand::CloseContactor)),
             (Self::Authorizing, ConnectorEvent::ChargingAuthorized(_)) => {
                 (Self::Starting, Some(ConnectorCommand::CloseContactor))
             }
@@ -393,7 +419,21 @@ impl ConnectorState {
             // no transaction running, which is exactly `Locked` - so the driver's next identifier
             // (or a CSMS `UnlockConnector`) is what releases it, as the requirement asks.
             (Self::StoppingLocked, ConnectorEvent::ContactorOpened) => (Self::Locked, None),
-            (Self::Finishing, ConnectorEvent::UnlockConfirmed) => (Self::Connected, None),
+            // `Finishing` is the post-transaction rest state while the cable stays in. The
+            // unlock confirmation completing the stop sequence must not end it - only the
+            // cable leaving does, which is what frees the bay (and, under
+            // `TxStopPoint::EVConnected`, finally closes the transaction).
+            (Self::Finishing, ConnectorEvent::UnlockConfirmed) => (Self::Finishing, None),
+            (Self::Finishing, ConnectorEvent::CableDisconnected) => (Self::Available, None),
+            // The hardware only reports edges, so a missed unplug/replug pair surfaces as
+            // `CableConnected` while already `Finishing` - recover by re-locking through
+            // `Connected` rather than wedging.
+            (Self::Finishing, ConnectorEvent::CableConnected) => {
+                (Self::Connected, Some(ConnectorCommand::Lock))
+            }
+            // A post-session re-swipe is a fresh presentation - the same `Authorizing` wait a
+            // token gets anywhere else the cable is in.
+            (Self::Finishing, ConnectorEvent::IdTokenPresented(_)) => (Self::Authorizing, None),
             (Self::Connected, ConnectorEvent::CableDisconnected) => (Self::Available, None),
             (_, ConnectorEvent::SetUnavailable) => (Self::Unavailable, None),
             (Self::Faulted | Self::FaultedSafe, ConnectorEvent::SetAvailable) => (*self, None),
@@ -573,9 +613,11 @@ mod suspension_tests {
     #[test]
     fn charging_cannot_be_suspended_before_it_starts() {
         for state in [
+            ConnectorState::Connected,
             ConnectorState::Locked,
             ConnectorState::Authorizing,
             ConnectorState::Starting,
+            ConnectorState::Finishing,
         ] {
             let mut connector = state;
             assert!(
@@ -588,5 +630,177 @@ mod suspension_tests {
             );
             assert_eq!(connector, state);
         }
+    }
+}
+
+#[cfg(test)]
+mod finishing_tests {
+    use super::*;
+    use crate::state::{IdToken, IdTokenKind, StopReason};
+
+    /// Drives a connector through a real stop so tests start from the state the machine
+    /// actually settles into - not a constructed assumption of one.
+    fn finishing() -> ConnectorState {
+        let mut connector = ConnectorState::Charging;
+        connector.apply(
+            ConnectorEvent::ChargingStopped(StopReason::Remote),
+            ConnectorPolicy::default(),
+        );
+        connector.apply(ConnectorEvent::ContactorOpened, ConnectorPolicy::default());
+        assert_eq!(connector, ConnectorState::Finishing);
+        connector
+    }
+
+    fn id_token() -> IdToken {
+        IdToken {
+            value: "04A224B2".into(),
+            kind: IdTokenKind::ISO14443,
+        }
+    }
+
+    /// `Finishing` is the post-transaction rest state while the cable stays in - which is
+    /// exactly what 1.6J's `Finishing` wire status means and what an operator billing for bay
+    /// occupancy needs to see. The unlock confirmation completing the stop sequence must not
+    /// end it; only the cable leaving does.
+    #[test]
+    fn finishing_holds_until_the_cable_leaves() {
+        let mut connector = finishing();
+
+        assert!(
+            !connector
+                .apply(
+                    ConnectorEvent::UnlockConfirmed,
+                    ConnectorPolicy::default()
+                )
+                .changed
+        );
+        assert_eq!(connector, ConnectorState::Finishing);
+
+        assert!(
+            connector
+                .apply(
+                    ConnectorEvent::CableDisconnected,
+                    ConnectorPolicy::default()
+                )
+                .changed
+        );
+        assert_eq!(connector, ConnectorState::Available);
+    }
+
+    /// The cable never left, so the bay is still occupied - and OCPP F01's premise (start now,
+    /// the cable is already in) holds on `Finishing` exactly as on `Locked`.
+    #[test]
+    fn finishing_accepts_a_remote_start() {
+        let mut connector = finishing();
+
+        let transition = connector.apply(
+            ConnectorEvent::RemoteStartRequested {
+                id_token: id_token(),
+                remote_start_id: Some(7),
+            },
+            ConnectorPolicy::default(),
+        );
+
+        assert_eq!(connector, ConnectorState::Starting);
+        assert!(matches!(
+            transition.command,
+            Some(ConnectorCommand::CloseContactor)
+        ));
+    }
+
+    /// F01.FR.01, on `Finishing`: the operator asked for remote starts to be authorized like
+    /// local ones, so the connector waits for the decision rather than closing the contactor.
+    #[test]
+    fn a_remote_start_from_finishing_authorizes_first_when_policy_says_so() {
+        let mut connector = finishing();
+        let policy = ConnectorPolicy {
+            authorize_remote_start: true,
+            ..Default::default()
+        };
+
+        connector.apply(
+            ConnectorEvent::RemoteStartRequested {
+                id_token: id_token(),
+                remote_start_id: None,
+            },
+            policy,
+        );
+
+        assert_eq!(connector, ConnectorState::Authorizing);
+    }
+
+    /// `Connected` covers both a connector whose `LockConfirmed` has not landed yet and a
+    /// lockless board resting post-plug - F01 must not wait on a lock that may not exist.
+    #[test]
+    fn connected_accepts_a_remote_start() {
+        let mut connector = ConnectorState::Connected;
+
+        let transition = connector.apply(
+            ConnectorEvent::RemoteStartRequested {
+                id_token: id_token(),
+                remote_start_id: None,
+            },
+            ConnectorPolicy::default(),
+        );
+
+        assert_eq!(connector, ConnectorState::Starting);
+        assert!(matches!(
+            transition.command,
+            Some(ConnectorCommand::CloseContactor)
+        ));
+    }
+
+    #[test]
+    fn a_remote_start_from_connected_authorizes_first_when_policy_says_so() {
+        let mut connector = ConnectorState::Connected;
+        let policy = ConnectorPolicy {
+            authorize_remote_start: true,
+            ..Default::default()
+        };
+
+        connector.apply(
+            ConnectorEvent::RemoteStartRequested {
+                id_token: id_token(),
+                remote_start_id: None,
+            },
+            policy,
+        );
+
+        assert_eq!(connector, ConnectorState::Authorizing);
+    }
+
+    /// A presented token starts authorization from any cable-in rest state - `Connected` is
+    /// where it lands when the cable event and the presentation arrive in the same batch (the
+    /// token reaches the machine before `LockConfirmed` does), and `Finishing` is a re-swipe
+    /// after the previous session.
+    #[test]
+    fn a_token_presented_on_connected_or_finishing_authorizes() {
+        for state in [ConnectorState::Connected, ConnectorState::Finishing] {
+            let mut connector = state;
+
+            connector.apply(
+                ConnectorEvent::IdTokenPresented(id_token()),
+                ConnectorPolicy::default(),
+            );
+
+            assert_eq!(connector, ConnectorState::Authorizing, "from {state:?}");
+        }
+    }
+
+    /// The hardware only reports edges, so a missed unplug/replug pair surfaces as
+    /// `CableConnected` while already `Finishing` - recover by re-locking through `Connected`
+    /// rather than wedging.
+    #[test]
+    fn a_cable_seen_still_in_finishing_relocks_the_connector() {
+        let mut connector = finishing();
+
+        let transition = connector.apply(
+            ConnectorEvent::CableConnected,
+            ConnectorPolicy::default(),
+        );
+
+        assert!(transition.changed);
+        assert_eq!(connector, ConnectorState::Connected);
+        assert!(matches!(transition.command, Some(ConnectorCommand::Lock)));
     }
 }

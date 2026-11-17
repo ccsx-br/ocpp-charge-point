@@ -706,7 +706,9 @@ pub enum ConnectorEvent {
     /// no active transaction. See `docs/ROADMAP.md` §6.
     RemoteUnlockRequested,
     /// The CSMS asked to start a transaction (OCPP `RequestStartTransaction`) while the
-    /// connector is `Locked` with no active transaction. Unlike `IdTokenPresented`, this skips
+    /// connector is cable-occupied with no active transaction - `Locked`, but also `Connected`
+    /// (a lock confirmation still in flight, or a lockless board) and `Finishing` (the
+    /// post-session rest state with the cable still in). Unlike `IdTokenPresented`, this skips
     /// straight to `Starting` without a separate Authorize round-trip - the CSMS's own request
     /// is itself the authorization decision. Carries the identifier the CSMS supplied and the
     /// request's `remoteStartId`, both recorded on the [`Transaction`] this starts - the latter
