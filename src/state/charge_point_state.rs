@@ -5008,6 +5008,50 @@ mod tests {
         );
     }
 
+    /// `EVConnected` keeps the transaction open across `Finishing`, so a restart from that
+    /// rest state - here a remote start injected straight into the machine - must continue the
+    /// *same* transaction (the bay never stopped being occupied) rather than mint a second one.
+    /// `starts_transaction` matching `Finishing -> Starting` is what lets the charging state
+    /// resume; `slot.is_none()` in `advance_transaction` is what keeps it from duplicating.
+    #[test]
+    fn ev_connected_continues_the_same_transaction_when_the_cable_never_left() {
+        let mut state = ChargePointState::new([1]);
+        set_string(&mut state, "TxCtrlr", "TxStopPoint", "EVConnected");
+        charging_connector(&mut state);
+        let id = transaction(&state).unwrap().id;
+
+        apply_connector_event(
+            &mut state,
+            ConnectorEvent::ChargingStopped(StopReason::Local),
+        );
+        apply_connector_event(&mut state, ConnectorEvent::ContactorOpened);
+        apply_connector_event(&mut state, ConnectorEvent::UnlockConfirmed);
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Finishing);
+
+        let effects = apply_connector_event(
+            &mut state,
+            ConnectorEvent::RemoteStartRequested {
+                id_token: test_id_token(),
+                remote_start_id: None,
+            },
+        );
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Starting);
+        assert_eq!(
+            transaction(&state).unwrap().id,
+            id,
+            "the cable never left, so the same transaction resumes"
+        );
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                ChargePointEffect::TransactionEvent(occurred)
+                    if occurred.kind == TransactionEventKind::Started
+            )),
+            "no second Started for a transaction that never ended"
+        );
+    }
+
     /// A stop point is a condition that *ceases* to hold, so a configured set resolves to its
     /// **earliest** member - the opposite of `TxStartPoint`, and the one thing about this
     /// variable worth getting wrong quietly.

@@ -617,6 +617,7 @@ mod suspension_tests {
             ConnectorState::Locked,
             ConnectorState::Authorizing,
             ConnectorState::Starting,
+            ConnectorState::Stopping,
             ConnectorState::Finishing,
         ] {
             let mut connector = state;
