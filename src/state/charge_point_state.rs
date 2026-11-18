@@ -2955,7 +2955,10 @@ fn ends_transaction(
         TxStopPoint::EVConnected => {
             matches!(
                 previous_state,
-                ConnectorState::Connected | ConnectorState::Finishing
+                ConnectorState::Connected
+                    | ConnectorState::Locked
+                    | ConnectorState::Authorizing
+                    | ConnectorState::Finishing
             ) && new_state == ConnectorState::Available
         }
     }
@@ -5005,6 +5008,31 @@ mod tests {
             ended.stop_reason,
             Some(StopReason::Local),
             "the reason recorded when the stop began must outlive it"
+        );
+    }
+
+    /// Under `EVConnected` the cable itself books the transaction, so an unplug from `Locked`
+    /// - lockless board, or an authorization still in flight - must close it, not dangle it.
+    #[test]
+    fn ev_connected_ends_the_transaction_when_the_cable_leaves_locked() {
+        let mut state = ChargePointState::new([1]);
+        set_string(&mut state, "TxCtrlr", "TxStartPoint", "EVConnected");
+        set_string(&mut state, "TxCtrlr", "TxStopPoint", "EVConnected");
+
+        apply_connector_event(&mut state, ConnectorEvent::CableConnected);
+        apply_connector_event(&mut state, ConnectorEvent::LockConfirmed);
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Locked);
+        assert!(
+            transaction(&state).is_some(),
+            "EVConnected starts the transaction at the cable"
+        );
+
+        apply_connector_event(&mut state, ConnectorEvent::CableDisconnected);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Available);
+        assert!(
+            transaction(&state).is_none(),
+            "the cable leaving Locked ends the transaction"
         );
     }
 

@@ -435,6 +435,13 @@ impl ConnectorState {
             // token gets anywhere else the cable is in.
             (Self::Finishing, ConnectorEvent::IdTokenPresented(_)) => (Self::Authorizing, None),
             (Self::Connected, ConnectorEvent::CableDisconnected) => (Self::Available, None),
+            // `Locked` and `Authorizing` read "cable in" like `Connected` does, but neither
+            // physically holds it: boards without a lock actuator never had it held, and an
+            // authorization in flight does not outlive the driver leaving.
+            (
+                Self::Locked | Self::Authorizing,
+                ConnectorEvent::CableDisconnected,
+            ) => (Self::Available, None),
             (_, ConnectorEvent::SetUnavailable) => (Self::Unavailable, None),
             (Self::Faulted | Self::FaultedSafe, ConnectorEvent::SetAvailable) => (*self, None),
             (_, ConnectorEvent::SetAvailable) => (Self::Available, None),
@@ -544,6 +551,25 @@ mod suspension_tests {
             connector.apply(ConnectorEvent::ChargingResumed, ConnectorPolicy::default());
         assert!(!transition.changed);
         assert_eq!(connector, ConnectorState::Locked);
+    }
+
+    /// `Locked` and `Authorizing` still read "cable in" to the rest of the machine, but the
+    /// cable can physically leave either: boards without a lock actuator never hold it, and an
+    /// authorization in flight does not survive the driver walking away. Same bay-freeing as
+    /// `Connected`.
+    #[test]
+    fn a_pre_charge_unplug_frees_the_bay() {
+        for state in [ConnectorState::Locked, ConnectorState::Authorizing] {
+            let mut connector = state;
+
+            let transition = connector.apply(
+                ConnectorEvent::CableDisconnected,
+                ConnectorPolicy::default(),
+            );
+
+            assert!(transition.changed, "{state:?} must release on unplug");
+            assert_eq!(connector, ConnectorState::Available);
+        }
     }
 
     #[test]
