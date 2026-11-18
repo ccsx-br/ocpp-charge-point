@@ -42,6 +42,16 @@ pub enum ConnectorState {
     /// by the time the contactor confirms open, the event that caused the stop is long gone, so
     /// the decision has to be carried in the state itself.
     StoppingLocked,
+    /// Charging has stopped and the contactor is opening, and the cable is *already out* -
+    /// the `CableDisconnected` either caused the stop or arrived while it settled.
+    ///
+    /// Identical to [`Self::Stopping`] except where it settles: `Stopping`'s `Finishing` waits
+    /// for a disconnect the hardware already reported - it only reports edges and will not
+    /// repeat one - so this settles straight to [`Self::Available`]. It is a separate state for
+    /// the same reason [`Self::StoppingLocked`] is: the transition function is pure, so the
+    /// cable-out fact has to live in the state itself. A cable coming back mid-settle
+    /// (`CableConnected`) returns the connector to `Stopping`, which then finishes normally.
+    StoppingUnplugged,
     /// The transaction ended and the contactor is open; the cable may still be plugged in.
     /// This is the connector's post-session rest state while the bay stays occupied - it
     /// exits only when the cable leaves (`CableDisconnected` → `Available`), which is what
@@ -269,6 +279,7 @@ impl ConnectorState {
             | Self::SuspendedEvse
             | Self::Stopping
             | Self::StoppingLocked
+            | Self::StoppingUnplugged
             | Self::Finishing
             | Self::Unlocking => ConnectorStatus::Occupied,
             Self::Unavailable => ConnectorStatus::Unavailable,
@@ -306,14 +317,18 @@ impl ConnectorState {
             // use cases this is, is the operator's configuration - not something the charge point
             // gets to decide, and not something it may silently pick one of.
             //
-            // Stopping opens the contactor first, exactly as any other stop does: the fail-safe
+            // The contactor still opens first, exactly as any other stop does: the fail-safe
             // ordering is not negotiable just because the cable is already out on the EV side.
+            // The settle is `StoppingUnplugged` rather than `Stopping`, though: `Finishing`
+            // would wait for a second `CableDisconnected` the hardware already spent on this
+            // transition - it reports edges, and edges do not repeat.
             (
                 Self::Charging | Self::SuspendedEv | Self::SuspendedEvse,
                 ConnectorEvent::CableDisconnected,
-            ) if policy.stop_tx_on_ev_side_disconnect => {
-                (Self::Stopping, Some(ConnectorCommand::OpenContactor))
-            }
+            ) if policy.stop_tx_on_ev_side_disconnect => (
+                Self::StoppingUnplugged,
+                Some(ConnectorCommand::OpenContactor),
+            ),
             // E10: suspended, not stopped. The transaction stays open and resumes if the cable
             // comes back - `ChargingResumed` from `SuspendedEv` is already the way back.
             (Self::Charging | Self::SuspendedEvse, ConnectorEvent::CableDisconnected) => {
@@ -332,10 +347,9 @@ impl ConnectorState {
             // and the token in the same batch - must not be dropped: `Connected` is as much a
             // cable-in rest state as `Locked` is, and on a lockless board it is the *only*
             // latched state there is.
-            (
-                Self::Connected | Self::Locked,
-                ConnectorEvent::IdTokenPresented(_),
-            ) => (Self::Authorizing, None),
+            (Self::Connected | Self::Locked, ConnectorEvent::IdTokenPresented(_)) => {
+                (Self::Authorizing, None)
+            }
             // Plug & Charge takes the identical path: the certificate changes who can answer the
             // authorization question, not what the connector is waiting for while they do.
             (Self::Locked, ConnectorEvent::ContractCertificatePresented { .. }) => {
@@ -366,19 +380,23 @@ impl ConnectorState {
             (
                 Self::Connected | Self::Finishing,
                 ConnectorEvent::RemoteStartRequested { ref id_token, .. },
-            ) if policy.authorize_remote_start && id_token.kind.requires_authorization() =>
-            {
+            ) if policy.authorize_remote_start && id_token.kind.requires_authorization() => {
                 (Self::Authorizing, None)
             }
-            (
-                Self::Connected | Self::Finishing,
-                ConnectorEvent::RemoteStartRequested { .. },
-            ) => (Self::Starting, Some(ConnectorCommand::CloseContactor)),
+            (Self::Connected | Self::Finishing, ConnectorEvent::RemoteStartRequested { .. }) => {
+                (Self::Starting, Some(ConnectorCommand::CloseContactor))
+            }
             (Self::Authorizing, ConnectorEvent::ChargingAuthorized(_)) => {
                 (Self::Starting, Some(ConnectorCommand::CloseContactor))
             }
             (Self::Authorizing, ConnectorEvent::AuthorizationDenied) => (Self::Locked, None),
             (Self::Starting, ConnectorEvent::ContactorClosed) => (Self::Charging, None),
+            // A cable that leaves while the start is still acknowledging aborts into the same
+            // fail-safe settle: the contactor may already be closed, so it opens.
+            (Self::Starting, ConnectorEvent::CableDisconnected) => (
+                Self::StoppingUnplugged,
+                Some(ConnectorCommand::OpenContactor),
+            ),
             // Suspension is a pause *within* a running transaction, not a stop: the contactor
             // stays closed and the cable stays locked, so the way out is either a resume or the
             // same `ChargingStopped` path any charging connector takes.
@@ -415,10 +433,33 @@ impl ConnectorState {
             (Self::Stopping, ConnectorEvent::ContactorOpened) => {
                 (Self::Finishing, Some(ConnectorCommand::Unlock))
             }
+            // An unplug landing mid-settle converts the pending stop into a cable-out one: the
+            // disconnect edge `Finishing` would wait for already happened. From `StoppingLocked`
+            // the same event is the station's retained plug leaving - there is nothing left to
+            // retain, so it converges the same way.
+            (Self::Stopping | Self::StoppingLocked, ConnectorEvent::CableDisconnected) => {
+                (Self::StoppingUnplugged, None)
+            }
             // E09.FR.03: contactor confirmed open, and no unlock. The cable is still latched with
             // no transaction running, which is exactly `Locked` - so the driver's next identifier
             // (or a CSMS `UnlockConnector`) is what releases it, as the requirement asks.
             (Self::StoppingLocked, ConnectorEvent::ContactorOpened) => (Self::Locked, None),
+            // The cable-out settle: no `Finishing` dwell, because the disconnect it exists to
+            // wait on already happened. The unlock still runs - the last command of the stop
+            // sequence, issued even though the driver already walked off with the cable.
+            (Self::StoppingUnplugged, ConnectorEvent::ContactorOpened) => {
+                (Self::Available, Some(ConnectorCommand::Unlock))
+            }
+            // A replug while the stop was still settling means the cable *was* in when it
+            // finished - back to the normal settle, which rests at `Finishing`.
+            (Self::StoppingUnplugged, ConnectorEvent::CableConnected) => (Self::Stopping, None),
+            // An in-flight close can still acknowledge after the open was issued (the START a
+            // `Starting` abort interrupted, say): the contactor just regressed to closed, so
+            // the open is re-asserted rather than trusted to have landed last.
+            (Self::StoppingUnplugged, ConnectorEvent::ContactorClosed) => (
+                Self::StoppingUnplugged,
+                Some(ConnectorCommand::OpenContactor),
+            ),
             // `Finishing` is the post-transaction rest state while the cable stays in. The
             // unlock confirmation completing the stop sequence must not end it - only the
             // cable leaving does, which is what frees the bay (and, under
@@ -437,11 +478,12 @@ impl ConnectorState {
             (Self::Connected, ConnectorEvent::CableDisconnected) => (Self::Available, None),
             // `Locked` and `Authorizing` read "cable in" like `Connected` does, but neither
             // physically holds it: boards without a lock actuator never had it held, and an
-            // authorization in flight does not outlive the driver leaving.
-            (
-                Self::Locked | Self::Authorizing,
-                ConnectorEvent::CableDisconnected,
-            ) => (Self::Available, None),
+            // authorization in flight does not outlive the driver leaving. The release goes
+            // through `Unlocking` anyway, because `Locked` is also where E09.FR.03 settles a
+            // *retained* plug - on a station whose lock is real, this is what lets it go.
+            (Self::Locked | Self::Authorizing, ConnectorEvent::CableDisconnected) => {
+                (Self::Unlocking, Some(ConnectorCommand::Unlock))
+            }
             (_, ConnectorEvent::SetUnavailable) => (Self::Unavailable, None),
             (Self::Faulted | Self::FaultedSafe, ConnectorEvent::SetAvailable) => (*self, None),
             (_, ConnectorEvent::SetAvailable) => (Self::Available, None),
@@ -555,8 +597,10 @@ mod suspension_tests {
 
     /// `Locked` and `Authorizing` still read "cable in" to the rest of the machine, but the
     /// cable can physically leave either: boards without a lock actuator never hold it, and an
-    /// authorization in flight does not survive the driver walking away. Same bay-freeing as
-    /// `Connected`.
+    /// authorization in flight does not survive the driver walking away. The bay is freed
+    /// through `Unlocking` rather than directly, so a station whose retention lock *is* real
+    /// (E09.FR.03 - `StoppingLocked` settles to `Locked` on purpose) releases it instead of
+    /// reporting `Available` over a plug still latched.
     #[test]
     fn a_pre_charge_unplug_frees_the_bay() {
         for state in [ConnectorState::Locked, ConnectorState::Authorizing] {
@@ -567,9 +611,152 @@ mod suspension_tests {
                 ConnectorPolicy::default(),
             );
 
-            assert!(transition.changed, "{state:?} must release on unplug");
+            assert_eq!(
+                connector,
+                ConnectorState::Unlocking,
+                "{state:?} must route the release through Unlock"
+            );
+            assert!(matches!(transition.command, Some(ConnectorCommand::Unlock)));
+            connector.apply(ConnectorEvent::UnlockConfirmed, ConnectorPolicy::default());
             assert_eq!(connector, ConnectorState::Available);
         }
+    }
+
+    /// A retention lock that kept the station's end of the cable (E09.FR.03: the EV-side
+    /// disconnect stopped through `StoppingLocked` into `Locked`) still has to release when the
+    /// plug itself leaves - the cable cannot be held if it is physically gone.
+    #[test]
+    fn a_retained_plug_leaving_still_releases_the_lock() {
+        let policy = ConnectorPolicy {
+            unlock_on_ev_side_disconnect: false,
+            ..ConnectorPolicy::default()
+        };
+        let mut connector = charging();
+
+        let transition = connector.apply(ConnectorEvent::CableDisconnected, policy);
+        assert_eq!(connector, ConnectorState::StoppingLocked);
+        assert!(matches!(
+            transition.command,
+            Some(ConnectorCommand::OpenContactor)
+        ));
+        connector.apply(ConnectorEvent::ContactorOpened, policy);
+        assert_eq!(connector, ConnectorState::Locked, "the plug is retained");
+
+        // The retained plug then leaves anyway (yanked, or a retention actuator that let go).
+        let transition = connector.apply(ConnectorEvent::CableDisconnected, policy);
+        assert_eq!(connector, ConnectorState::Unlocking);
+        assert!(matches!(transition.command, Some(ConnectorCommand::Unlock)));
+    }
+
+    /// The `CableDisconnected` that drives `Charging` into its stop is consumed by that
+    /// transition - `Finishing` would then wait forever for a second edge the hardware never
+    /// repeats. `StoppingUnplugged` carries the cable-out fact through the settle instead.
+    #[test]
+    fn a_cable_out_stop_settles_straight_to_available() {
+        for from in [
+            ConnectorState::Charging,
+            ConnectorState::SuspendedEv,
+            ConnectorState::SuspendedEvse,
+        ] {
+            let mut connector = from;
+
+            let transition = connector.apply(
+                ConnectorEvent::CableDisconnected,
+                ConnectorPolicy::default(),
+            );
+
+            assert_eq!(
+                connector,
+                ConnectorState::StoppingUnplugged,
+                "from {from:?}"
+            );
+            assert!(matches!(
+                transition.command,
+                Some(ConnectorCommand::OpenContactor)
+            ));
+
+            let transition =
+                connector.apply(ConnectorEvent::ContactorOpened, ConnectorPolicy::default());
+            assert_eq!(
+                connector,
+                ConnectorState::Available,
+                "the cable already left - Finishing would wedge"
+            );
+            assert!(matches!(transition.command, Some(ConnectorCommand::Unlock)));
+        }
+    }
+
+    /// An unplug landing mid-settle - the driver left after the stop was already in flight -
+    /// must not wedge on `Finishing` either: the disconnect edge the settle would have waited
+    /// on already happened.
+    #[test]
+    fn an_unplug_mid_settle_still_frees_the_bay() {
+        for stopping in [ConnectorState::Stopping, ConnectorState::StoppingLocked] {
+            let mut connector = stopping;
+
+            let transition = connector.apply(
+                ConnectorEvent::CableDisconnected,
+                ConnectorPolicy::default(),
+            );
+
+            assert_eq!(
+                connector,
+                ConnectorState::StoppingUnplugged,
+                "from {stopping:?}"
+            );
+            assert!(transition.command.is_none(), "the open is already sent");
+            connector.apply(ConnectorEvent::ContactorOpened, ConnectorPolicy::default());
+            assert_eq!(connector, ConnectorState::Available);
+        }
+    }
+
+    /// A driver who replugs while the stop is still settling still had their cable in when it
+    /// finished - `Finishing`, the normal post-session rest state, is where that belongs.
+    #[test]
+    fn a_replug_mid_settle_finishes_normally() {
+        let mut connector = charging();
+        connector.apply(
+            ConnectorEvent::CableDisconnected,
+            ConnectorPolicy::default(),
+        );
+        assert_eq!(connector, ConnectorState::StoppingUnplugged);
+
+        let transition =
+            connector.apply(ConnectorEvent::CableConnected, ConnectorPolicy::default());
+        assert_eq!(connector, ConnectorState::Stopping);
+        assert!(transition.command.is_none(), "the open is already sent");
+
+        connector.apply(ConnectorEvent::ContactorOpened, ConnectorPolicy::default());
+        assert_eq!(connector, ConnectorState::Finishing);
+    }
+
+    /// The start window is not exempt: a cable that leaves between `ChargingAuthorized` and the
+    /// contactor closing must still open the contactor (it may already be closed) and free the
+    /// bay once that confirms - not wedge in `Starting`.
+    #[test]
+    fn a_starting_unplug_aborts_into_the_stop_path() {
+        let mut connector = ConnectorState::Starting;
+
+        let transition = connector.apply(
+            ConnectorEvent::CableDisconnected,
+            ConnectorPolicy::default(),
+        );
+
+        assert_eq!(connector, ConnectorState::StoppingUnplugged);
+        assert!(matches!(
+            transition.command,
+            Some(ConnectorCommand::OpenContactor)
+        ));
+
+        // The in-flight close can still acknowledge *after* the open was issued - the
+        // contactor just regressed to closed, so the open is re-asserted rather than trusted.
+        let transition =
+            connector.apply(ConnectorEvent::ContactorClosed, ConnectorPolicy::default());
+        assert_eq!(connector, ConnectorState::StoppingUnplugged);
+        assert!(matches!(
+            transition.command,
+            Some(ConnectorCommand::OpenContactor)
+        ));
     }
 
     #[test]
@@ -695,10 +882,7 @@ mod finishing_tests {
 
         assert!(
             !connector
-                .apply(
-                    ConnectorEvent::UnlockConfirmed,
-                    ConnectorPolicy::default()
-                )
+                .apply(ConnectorEvent::UnlockConfirmed, ConnectorPolicy::default())
                 .changed
         );
         assert_eq!(connector, ConnectorState::Finishing);
@@ -821,10 +1005,8 @@ mod finishing_tests {
     fn a_cable_seen_still_in_finishing_relocks_the_connector() {
         let mut connector = finishing();
 
-        let transition = connector.apply(
-            ConnectorEvent::CableConnected,
-            ConnectorPolicy::default(),
-        );
+        let transition =
+            connector.apply(ConnectorEvent::CableConnected, ConnectorPolicy::default());
 
         assert!(transition.changed);
         assert_eq!(connector, ConnectorState::Connected);

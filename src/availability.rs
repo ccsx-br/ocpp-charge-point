@@ -1257,6 +1257,7 @@ mod deduped_status_notifier_tests {
                 ConnectorState::SuspendedEvse => 12,
                 ConnectorState::Stopping
                 | ConnectorState::StoppingLocked
+                | ConnectorState::StoppingUnplugged
                 | ConnectorState::Finishing
                 | ConnectorState::Unlocking => 13,
                 other => other.availability_status() as u16,
@@ -2120,6 +2121,7 @@ mod ocpp_1_6 {
             ConnectorState::SuspendedEvse => StatusNotificationRequestStatus::SuspendedEVSE,
             ConnectorState::Stopping
             | ConnectorState::StoppingLocked
+            | ConnectorState::StoppingUnplugged
             | ConnectorState::Finishing
             | ConnectorState::Unlocking => StatusNotificationRequestStatus::Finishing,
             ConnectorState::Unavailable => StatusNotificationRequestStatus::Unavailable,

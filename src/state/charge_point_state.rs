@@ -16,15 +16,15 @@ use crate::state::{
     AfrrSignal, AuthorizationCache, AuthorizationRequested, BatterySwapStore, ChargePointEffect,
     ChargePointEvent, ChargingProfileScope, ChargingProfileStore, Component, ConnectorEvent,
     ConnectorState, ConnectorStatus, ConnectorStatusChanged, DERControlStore, DeviceModel,
-    DeviceModelEvent, DeviceModelShape, DisplayMessageStore, EventTrigger, EvseEvent, EvseState, EvseStatus,
-    ExternalChargingLimit, HardwareCommand, IdToken, LocalAuthorizationList, LocalListEntry,
-    MeterSample, NetworkProfileStore, PendingReset, PeriodicEventStreamStore, RegistrationStatus,
-    ReservationEndReason, ReservationUpdate, ResetKind, ResetTarget, SecurityEvent,
-    SecurityEventType, SmartChargingNotification, StateLimits, StopReason, TariffStore,
-    Transaction, TransactionChargingState, TransactionEventKind, TransactionEventOccurred,
-    TransactionId, TransactionUpdateReason, TriggeredMonitor, Variable, VariableAttribute,
-    VariableAttributeType, VariableCharacteristics, VariableDataType, VariableMonitorStore,
-    VariableMonitoringEvent, VariableMutability,
+    DeviceModelEvent, DeviceModelShape, DisplayMessageStore, EventTrigger, EvseEvent, EvseState,
+    EvseStatus, ExternalChargingLimit, HardwareCommand, IdToken, LocalAuthorizationList,
+    LocalListEntry, MeterSample, NetworkProfileStore, PendingReset, PeriodicEventStreamStore,
+    RegistrationStatus, ReservationEndReason, ReservationUpdate, ResetKind, ResetTarget,
+    SecurityEvent, SecurityEventType, SmartChargingNotification, StateLimits, StopReason,
+    TariffStore, Transaction, TransactionChargingState, TransactionEventKind,
+    TransactionEventOccurred, TransactionId, TransactionUpdateReason, TriggeredMonitor, Variable,
+    VariableAttribute, VariableAttributeType, VariableCharacteristics, VariableDataType,
+    VariableMonitorStore, VariableMonitoringEvent, VariableMutability,
 };
 
 /// The wire value OCPP's `AvailabilityState` takes for `status` - the same
@@ -372,17 +372,13 @@ impl ChargePointState {
             // `DeviceModelShape`. A 1.6-only charge point never serves `GetVariables`/
             // `GetBaseReport`, so the catalog is dead RAM on a constrained build.
             device_model: match limits.device_model_shape {
-                DeviceModelShape::Full => DeviceModel::with_topology(
-                    limits.max_device_model_variables,
-                    &connector_counts,
-                ),
-                DeviceModelShape::TopologyOnly => DeviceModel::topology_only(
-                    limits.max_device_model_variables,
-                    &connector_counts,
-                ),
-                DeviceModelShape::Empty => {
-                    DeviceModel::empty(limits.max_device_model_variables)
+                DeviceModelShape::Full => {
+                    DeviceModel::with_topology(limits.max_device_model_variables, &connector_counts)
                 }
+                DeviceModelShape::TopologyOnly => {
+                    DeviceModel::topology_only(limits.max_device_model_variables, &connector_counts)
+                }
+                DeviceModelShape::Empty => DeviceModel::empty(limits.max_device_model_variables),
             },
             capabilities: Capabilities::default(),
             network_profiles: NetworkProfileStore::with_max_slots(limits.max_network_profile_slots),
@@ -2461,7 +2457,7 @@ impl ChargePointState {
                 .any(|(evse_id, connector_id)| {
                     matches!(
                         self.evses[evse_id].connectors[connector_id],
-                        ConnectorState::Stopping
+                        ConnectorState::Stopping | ConnectorState::StoppingUnplugged
                     )
                 }),
             ResetKind::OnIdle => !self
@@ -2944,13 +2940,17 @@ fn ends_transaction(
                     | ConnectorState::SuspendedEvse
             ) && matches!(
                 new_state,
-                ConnectorState::Stopping | ConnectorState::StoppingLocked
+                ConnectorState::Stopping
+                    | ConnectorState::StoppingLocked
+                    | ConnectorState::StoppingUnplugged
             )
         }
         TxStopPoint::PowerPathClosed => {
             (previous_state == ConnectorState::Stopping && new_state == ConnectorState::Finishing)
                 || (previous_state == ConnectorState::StoppingLocked
                     && new_state == ConnectorState::Locked)
+                || (previous_state == ConnectorState::StoppingUnplugged
+                    && new_state == ConnectorState::Available)
         }
         TxStopPoint::EVConnected => {
             matches!(
@@ -2959,6 +2959,8 @@ fn ends_transaction(
                     | ConnectorState::Locked
                     | ConnectorState::Authorizing
                     | ConnectorState::Finishing
+                    | ConnectorState::StoppingUnplugged
+                    | ConnectorState::Unlocking
             ) && new_state == ConnectorState::Available
         }
     }
@@ -3024,7 +3026,9 @@ fn advance_transaction(
             | ConnectorState::SuspendedEvse
     ) && matches!(
         new_state,
-        ConnectorState::Stopping | ConnectorState::StoppingLocked
+        ConnectorState::Stopping
+            | ConnectorState::StoppingLocked
+            | ConnectorState::StoppingUnplugged
     ) && let Some(transaction) = slot.as_mut()
     {
         transaction.stop_reason = event_stop_reason;
@@ -3034,6 +3038,11 @@ fn advance_transaction(
     // transition that used to merely update the transaction is now the one that closes it.
     if ends_transaction(previous_state, new_state, tx_stop_point) {
         let mut transaction = slot.take()?;
+        // A stop driven by the cable itself records no reason (the `CableDisconnected` event
+        // carries none): the cause is known anyway - it is exactly `EVDisconnected`.
+        if transaction.stop_reason.is_none() {
+            transaction.stop_reason = Some(StopReason::EVDisconnected);
+        }
         // The bay is only free once the cable is out; every earlier stop point leaves it in.
         transaction.charging_state = if new_state == ConnectorState::Available {
             TransactionChargingState::Idle
@@ -3154,15 +3163,10 @@ mod tests {
             StateLimits::new().with_device_model_shape(DeviceModelShape::TopologyOnly),
         );
 
-        assert!(
-            state
-                .device_model
-                .iter()
-                .all(|(component, _, _)| matches!(
-                    component.name.as_str(),
-                    "ChargingStation" | "EVSE" | "Connector" | "ConnectorPlugRetentionLock"
-                ))
-        );
+        assert!(state.device_model.iter().all(|(component, _, _)| matches!(
+            component.name.as_str(),
+            "ChargingStation" | "EVSE" | "Connector" | "ConnectorPlugRetentionLock"
+        )));
     }
 
     /// `DeviceModelShape::Empty` registers nothing - availability writes then no-op through
@@ -5028,12 +5032,62 @@ mod tests {
         );
 
         apply_connector_event(&mut state, ConnectorEvent::CableDisconnected);
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Unlocking);
+        assert!(
+            transaction(&state).is_some(),
+            "the bay is still occupied while the release confirms"
+        );
+
+        apply_connector_event(&mut state, ConnectorEvent::UnlockConfirmed);
 
         assert_eq!(state.evses[0].connectors[0], ConnectorState::Available);
         assert!(
             transaction(&state).is_none(),
             "the cable leaving Locked ends the transaction"
         );
+    }
+
+    /// The unplug that *causes* the stop is the same cable leaving: under `EVConnected` the
+    /// transaction must close when the cable-out settle reaches `Available`, carrying
+    /// `EVDisconnected` rather than whatever stopped it - nothing else ever claimed a reason.
+    #[test]
+    fn ev_connected_ends_a_cable_out_stop_at_available() {
+        let mut state = ChargePointState::new([1]);
+        set_string(&mut state, "TxCtrlr", "TxStopPoint", "EVConnected");
+        charging_connector(&mut state);
+        assert!(transaction(&state).is_some());
+
+        apply_connector_event(&mut state, ConnectorEvent::CableDisconnected);
+        assert_eq!(
+            state.evses[0].connectors[0],
+            ConnectorState::StoppingUnplugged,
+            "the disconnect already happened - Finishing would wedge"
+        );
+        assert!(
+            transaction(&state).is_some(),
+            "EVConnected keeps it open through the settle"
+        );
+
+        let effects = apply_connector_event(&mut state, ConnectorEvent::ContactorOpened);
+
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Available);
+        let ended = effects
+            .iter()
+            .find_map(|effect| match effect {
+                ChargePointEffect::TransactionEvent(occurred)
+                    if occurred.kind == TransactionEventKind::Ended =>
+                {
+                    Some(&occurred.transaction)
+                }
+                _ => None,
+            })
+            .expect("the cable-out settle reaching Available ends it");
+        assert_eq!(
+            ended.stop_reason,
+            Some(StopReason::EVDisconnected),
+            "the cable caused this stop - say so"
+        );
+        assert!(transaction(&state).is_none());
     }
 
     /// `EVConnected` keeps the transaction open across `Finishing`, so a restart from that
@@ -5514,7 +5568,9 @@ mod tests {
     }
 
     /// **E09**, the default: the cable leaving the EV ends the transaction, and it ends the
-    /// fail-safe way - contactor open first, exactly as any other stop.
+    /// fail-safe way - contactor open first, exactly as any other stop. The settle is
+    /// `StoppingUnplugged` because the disconnect edge is spent on this transition: a plain
+    /// `Stopping` would settle at `Finishing` and wait for a repeat that never comes.
     #[test]
     fn an_ev_side_disconnect_stops_the_transaction_by_default() {
         let mut state = ChargePointState::new([1]);
@@ -5522,7 +5578,10 @@ mod tests {
 
         let effects = apply_connector_event(&mut state, ConnectorEvent::CableDisconnected);
 
-        assert_eq!(state.evses[0].connectors[0], ConnectorState::Stopping);
+        assert_eq!(
+            state.evses[0].connectors[0],
+            ConnectorState::StoppingUnplugged
+        );
         assert!(effects.contains(&ChargePointEffect::HardwareCommand(
             crate::state::HardwareCommand::OpenContactor {
                 evse_id: 0,
@@ -5553,7 +5612,8 @@ mod tests {
     }
 
     /// **E09.FR.02**, the default: the station releases its own end too, so the driver can take
-    /// the cable away.
+    /// the cable away. The settle frees the bay outright - the cable is already gone, so there
+    /// is no `Finishing` dwell to serve.
     #[test]
     fn an_ev_side_disconnect_releases_the_station_end_by_default() {
         let mut state = ChargePointState::new([1]);
@@ -5562,7 +5622,7 @@ mod tests {
         apply_connector_event(&mut state, ConnectorEvent::CableDisconnected);
         let effects = apply_connector_event(&mut state, ConnectorEvent::ContactorOpened);
 
-        assert_eq!(state.evses[0].connectors[0], ConnectorState::Finishing);
+        assert_eq!(state.evses[0].connectors[0], ConnectorState::Available);
         assert!(effects.contains(&ChargePointEffect::HardwareCommand(
             crate::state::HardwareCommand::UnlockConnector {
                 evse_id: 0,
@@ -5616,7 +5676,8 @@ mod tests {
     }
 
     /// The retained-cable stop is still a stop: whatever the unlock setting, the transaction
-    /// ends at the same point in the stop and reports the same thing. Only the cable differs.
+    /// ends at the same point in the stop with the same reason. What differs is only the
+    /// charging state it closes on - a released bay is `Idle`, a retained one still occupied.
     #[test]
     fn a_retained_cable_stop_reports_the_same_ended_event_an_ordinary_one_does() {
         fn ended_transaction(retain_cable: bool) -> crate::state::Transaction {
@@ -5644,7 +5705,19 @@ mod tests {
                 .expect("the contactor opening ends it under the default stop point")
         }
 
-        assert_eq!(ended_transaction(true), ended_transaction(false));
+        let released = ended_transaction(false);
+        let retained = ended_transaction(true);
+        assert_eq!(released.stop_reason, retained.stop_reason);
+        assert_eq!(
+            released.charging_state,
+            crate::state::TransactionChargingState::Idle,
+            "the cable left - the bay is free"
+        );
+        assert_eq!(
+            retained.charging_state,
+            crate::state::TransactionChargingState::EvConnected,
+            "the plug is retained - the bay is still occupied"
+        );
     }
 
     /// E10 wins over E09's unlock setting: with the transaction suspended rather than stopped

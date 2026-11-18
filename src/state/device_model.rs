@@ -2065,20 +2065,16 @@ mod tests {
             + PLUG_RETENTION_LOCK_VARIABLES_PER_CONNECTOR;
         assert_eq!(model.len(), expected);
         assert_eq!(model.max_variables(), 64);
-        assert!(
-            model
-                .iter()
-                .all(|(component, variable, _)| matches!(
-                    component.name.as_str(),
-                    AVAILABILITY_COMPONENT_CHARGE_POINT
-                        | AVAILABILITY_COMPONENT_EVSE
-                        | AVAILABILITY_COMPONENT_CONNECTOR
-                        | PLUG_RETENTION_LOCK_COMPONENT
-                ) && matches!(
-                    variable.name.as_str(),
-                    "AvailabilityState" | "Available" | "Problem"
-                ))
-        );
+        assert!(model.iter().all(|(component, variable, _)| matches!(
+            component.name.as_str(),
+            AVAILABILITY_COMPONENT_CHARGE_POINT
+                | AVAILABILITY_COMPONENT_EVSE
+                | AVAILABILITY_COMPONENT_CONNECTOR
+                | PLUG_RETENTION_LOCK_COMPONENT
+        ) && matches!(
+            variable.name.as_str(),
+            "AvailabilityState" | "Available" | "Problem"
+        )));
     }
 
     /// The bound is still honoured when it exceeds the topology - unlike `with_topology`, there

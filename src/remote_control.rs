@@ -58,7 +58,9 @@ pub async fn handle_unlock_request(
         ConnectorState::Authorizing
         | ConnectorState::Starting
         | ConnectorState::Charging
-        | ConnectorState::Stopping => UnlockOutcome::OngoingAuthorizedTransaction,
+        | ConnectorState::Stopping
+        | ConnectorState::StoppingLocked
+        | ConnectorState::StoppingUnplugged => UnlockOutcome::OngoingAuthorizedTransaction,
         ConnectorState::Locked => {
             let mut updates = actor.subscribe();
             let _ = actor
@@ -450,7 +452,7 @@ fn find_start_target(
                 // flight, or a lockless board) and on `Finishing` (session over, cable still
                 // in - the post-transaction rest state).
                 ConnectorState::Locked | ConnectorState::Connected | ConnectorState::Finishing => {
-                    return Some((evse_id, connector_id, true))
+                    return Some((evse_id, connector_id, true));
                 }
                 // Reached only when the reservation admits this driver - `can_start_here` has
                 // already refused every other one.

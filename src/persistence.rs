@@ -1192,6 +1192,7 @@ enum PersistedConnectorState {
     // encodes the variants that follow it by position in some formats, so inserting one mid-list
     // would make an older record decode as the wrong state.
     StoppingLocked,
+    StoppingUnplugged,
 }
 
 impl From<ConnectorState> for PersistedConnectorState {
@@ -1207,6 +1208,7 @@ impl From<ConnectorState> for PersistedConnectorState {
             ConnectorState::SuspendedEvse => Self::SuspendedEvse,
             ConnectorState::Stopping => Self::Stopping,
             ConnectorState::StoppingLocked => Self::StoppingLocked,
+            ConnectorState::StoppingUnplugged => Self::StoppingUnplugged,
             ConnectorState::Finishing => Self::Finishing,
             ConnectorState::Unavailable => Self::Unavailable,
             ConnectorState::Faulted => Self::Faulted,
@@ -1230,6 +1232,7 @@ impl From<PersistedConnectorState> for ConnectorState {
             PersistedConnectorState::SuspendedEvse => Self::SuspendedEvse,
             PersistedConnectorState::Stopping => Self::Stopping,
             PersistedConnectorState::StoppingLocked => Self::StoppingLocked,
+            PersistedConnectorState::StoppingUnplugged => Self::StoppingUnplugged,
             PersistedConnectorState::Finishing => Self::Finishing,
             PersistedConnectorState::Unavailable => Self::Unavailable,
             PersistedConnectorState::Faulted => Self::Faulted,
